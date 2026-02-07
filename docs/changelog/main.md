@@ -78,3 +78,8 @@
    `To` header, and one for the specified `content.headers["To"]` value.  This
    has been fixed; the behavior now is to use the `content.headers["To"]`
    header and not to emit a per-recipient `To` header in this situation.
+ * When setting a custom `To` header to a template string (e.g., `content.headers["To"] = "{{ to }}"`)
+   in the HTTP injection API, if the template variable has no corresponding
+   substitution data, the template renders as an empty string. The injection
+   API now detects this condition and falls back to generating the per-recipient
+   `To` header to ensure all messages have a valid `To` header.
