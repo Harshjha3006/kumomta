@@ -76,3 +76,8 @@
    response. #495
  * smtp server: uncommon quoted local parts containing the `@` sign are now
    accepted by the envelope address parser. #495
+ * HTTP injection API: a `to_header` template substitution is now
+   pre-defined with the default `To` header value that would be generated
+   for the recipient. You can use `{{ to_header }}` in your `To` header
+   template and optionally override `to_header` in the per-recipient
+   substitutions for recipients where you want a different value.
