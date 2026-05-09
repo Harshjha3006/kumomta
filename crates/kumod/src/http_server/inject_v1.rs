@@ -129,6 +129,15 @@ pub struct Recipient {
         "gender": "male",
     }))]
     pub substitutions: HashMap<String, Value>,
+
+    /// Per-recipient metadata key-value pairs that will be stored in the
+    /// message's `rcpt_meta` metadata field.
+    #[serde(default)]
+    #[schema(additional_properties, example=json!({
+        "campaign_id": "promo-2026-q2",
+        "user_segment": "premium",
+    }))]
+    pub metadata: HashMap<String, Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug, ToSchema)]
@@ -812,6 +821,14 @@ async fn make_message<'a>(
     if let Some(hostname) = hostname {
         message.set_meta("hostname", hostname.to_string()).await?;
     }
+    if !recip.metadata.is_empty() {
+        message
+            .set_meta(
+                "rcpt_meta",
+                serde_json::Value::Object(recip.metadata.clone().into_iter().collect()),
+            )
+            .await?;
+    }
     Ok(message)
 }
 
@@ -1447,6 +1464,7 @@ This is a test message to {{ name }}, with some 👻🍉💩 emoji!
                 email: "user@example.com".to_string(),
                 name: Some("James Smythe".to_string()),
                 substitutions: HashMap::new(),
+                metadata: HashMap::new(),
             }],
             substitutions: HashMap::new(),
             content: Content::Rfc822(input.to_string()),
@@ -1496,6 +1514,7 @@ This is a test message to {{ name }}, with some 👻🍉💩 emoji!
                 email: "user@example.com".to_string(),
                 name: Some("James Smythe".to_string()),
                 substitutions: HashMap::new(),
+                metadata: HashMap::new(),
             }],
             substitutions: HashMap::new(),
             content: Content::Rfc822(input.to_string()),
@@ -1539,6 +1558,7 @@ This is a test message to James Smythe, with some =F0=9F=91=BB=F0=9F=8D=89=\r
                 email: "user@example.com".to_string(),
                 name: Some("James Smythe".to_string()),
                 substitutions: HashMap::new(),
+                metadata: HashMap::new(),
             }],
             substitutions: HashMap::new(),
             content: Content::Builder {
@@ -1624,6 +1644,7 @@ Some(
                 email: "user@example.com".to_string(),
                 name: Some("James Smythe".to_string()),
                 substitutions: HashMap::new(),
+                metadata: HashMap::new(),
             }],
             substitutions: HashMap::new(),
             content: Content::Builder {
@@ -1719,6 +1740,7 @@ Ok(
                 email: "user@example.com".to_string(),
                 name: Some("James Smythe".to_string()),
                 substitutions: HashMap::new(),
+                metadata: HashMap::new(),
             }],
             substitutions: HashMap::new(),
             content: Content::Builder {
@@ -1818,6 +1840,7 @@ Some(
                 email: "user@example.com".to_string(),
                 name: Some("James Smythe".to_string()),
                 substitutions: HashMap::new(),
+                metadata: HashMap::new(),
             }],
             substitutions: HashMap::new(),
             content: Content::Builder {
@@ -1889,6 +1912,7 @@ Some(
                 email: "user@example.com".to_string(),
                 name: Some("James Smythe".to_string()),
                 substitutions: HashMap::new(),
+                metadata: HashMap::new(),
             }],
             substitutions: HashMap::new(),
             content: Content::Builder {
@@ -1960,6 +1984,7 @@ Some(
                     email: "user@example.com".to_string(),
                     name: Some("James Smythe".to_string()),
                     substitutions: HashMap::new(),
+                    metadata: HashMap::new(),
                 },
                 Recipient {
                     email: "second@example.com".to_string(),
@@ -1970,6 +1995,7 @@ Some(
                     )]
                     .into_iter()
                     .collect(),
+                    metadata: HashMap::new(),
                 },
             ],
             substitutions: HashMap::new(),
@@ -2072,6 +2098,7 @@ Some(
                 email: "user@example.com".to_string(),
                 name: Some("James Smythe".to_string()),
                 substitutions: HashMap::new(),
+                metadata: HashMap::new(),
             }],
             substitutions: HashMap::new(),
             content: Content::Builder {
@@ -2149,6 +2176,7 @@ Some(
                 email: "user@example.com".to_string(),
                 name: Some("James Smythe".to_string()),
                 substitutions: HashMap::new(),
+                metadata: HashMap::new(),
             }],
             substitutions: HashMap::new(),
             content: Content::Builder {
