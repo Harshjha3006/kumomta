@@ -2677,6 +2677,83 @@ MergedEntry {
     }
 
     #[test]
+    fn test_adjust_config_rejects_negative_floor_percent() {
+        let err = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
+            name: "max_message_rate".to_string(),
+            decrease_percent: 10.0,
+            floor_percent: -1.0,
+            ramp_step_percent: None,
+            ramp_up_interval: std::time::Duration::from_secs(900),
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("floor_percent"), "{err}");
+    }
+
+    #[test]
+    fn test_adjust_config_rejects_decrease_percent_above_100() {
+        let err = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
+            name: "max_message_rate".to_string(),
+            decrease_percent: 100.1,
+            floor_percent: 25.0,
+            ramp_step_percent: None,
+            ramp_up_interval: std::time::Duration::from_secs(900),
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("decrease_percent"), "{err}");
+    }
+
+    #[test]
+    fn test_adjust_config_rejects_explicit_invalid_ramp_step_percent() {
+        let zero = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
+            name: "max_message_rate".to_string(),
+            decrease_percent: 10.0,
+            floor_percent: 25.0,
+            ramp_step_percent: Some(0.0),
+            ramp_up_interval: std::time::Duration::from_secs(900),
+        });
+        assert!(zero.is_err());
+
+        let negative = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
+            name: "max_message_rate".to_string(),
+            decrease_percent: 10.0,
+            floor_percent: 25.0,
+            ramp_step_percent: Some(-5.0),
+            ramp_up_interval: std::time::Duration::from_secs(900),
+        });
+        assert!(negative.is_err());
+    }
+
+    #[test]
+    fn test_adjust_config_accepts_inclusive_boundary_percentages() {
+        // decrease_percent == 100.0 (upper inclusive bound) and
+        // floor_percent == 0.0 (lower inclusive bound) are both valid.
+        let adj = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
+            name: "max_message_rate".to_string(),
+            decrease_percent: 100.0,
+            floor_percent: 0.0,
+            ramp_step_percent: Some(1.0),
+            ramp_up_interval: std::time::Duration::from_secs(900),
+        })
+        .unwrap();
+        assert_eq!(adj.decrease_percent, 100.0);
+        assert_eq!(adj.floor_percent, 0.0);
+    }
+
+    #[test]
+    fn test_adjust_config_accepts_all_supported_fields() {
+        for name in ADAPTIVE_SUPPORTED_FIELDS {
+            EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
+                name: name.to_string(),
+                decrease_percent: 10.0,
+                floor_percent: 25.0,
+                ramp_step_percent: None,
+                ramp_up_interval: std::time::Duration::from_secs(900),
+            })
+            .unwrap_or_else(|err| panic!("field {name:?} should be accepted: {err}"));
+        }
+    }
+
+    #[test]
     fn test_adjust_config_ramp_step_percent_defaults_to_decrease_percent() {
         let adj = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
             name: "connection_limit".to_string(),

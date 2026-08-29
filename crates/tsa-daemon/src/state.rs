@@ -1414,6 +1414,26 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_adaptive_field_value_accepts_all_rate_fields() {
+        // max_message_rate is covered by test_parse_adaptive_field_value_rate;
+        // confirm the other two ThrottleSpec fields share the same code path.
+        for field in ["max_connection_rate", "source_selection_rate"] {
+            let (limit, template) =
+                parse_adaptive_field_value(field, &toml::Value::String("50/hr".to_string()))
+                    .unwrap_or_else(|err| panic!("field {field:?} should be accepted: {err}"));
+            assert_eq!(limit, 50);
+            assert_eq!(
+                template,
+                AdaptiveFieldTemplate::Rate {
+                    period: 3600,
+                    max_burst: None,
+                    force_local: false
+                }
+            );
+        }
+    }
+
+    #[test]
     fn test_down_path_compounds_and_clamps_to_floor() {
         let state = TsaState::default();
         let scope = ActionHash::from_rule_and_record(
@@ -1482,6 +1502,121 @@ mod tests {
         assert_eq!(
             state.adaptive_overrides.get(&scope).unwrap().current_limit,
             250
+        );
+    }
+
+    #[test]
+    fn test_create_or_update_adaptive_override_forces_no_rollup_for_prefer_rollup_no() {
+        let state = TsaState::default();
+        // A rule matched at "default"/site scope has was_rollup=true.
+        let rule = simple_rule().clone_and_set_rollup();
+        assert!(rule.was_rollup);
+        let a = adj("connection_limit", 10.0, 25.0, 10.0);
+        let record = make_record(Utc::now());
+        let scope = ActionHash::from_rule_and_record(
+            &rule,
+            &Action::AdjustDomainConfig(a.clone()),
+            &record,
+        );
+
+        state
+            .create_or_update_adaptive_override(
+                &scope,
+                &rule,
+                &record,
+                &a,
+                "example.com",
+                "unspecified",
+                PreferRollup::No,
+                &toml::Value::Integer(100),
+            )
+            .unwrap();
+
+        // Even though the rule itself is rollup-scoped, PreferRollup::No
+        // (used for AdjustDomainConfig) must force mx_rollup=false.
+        assert!(!state.adaptive_overrides.get(&scope).unwrap().mx_rollup);
+    }
+
+    #[test]
+    fn test_create_or_update_adaptive_override_skips_when_already_expired() {
+        let state = TsaState::default();
+        let rule = simple_rule(); // duration = 30m
+        let a = adj("connection_limit", 10.0, 25.0, 10.0);
+        // A record timestamped well over 30 minutes ago means
+        // record.timestamp + rule.duration is already in the past.
+        let record = make_record(Utc::now() - chrono::Duration::hours(2));
+        let scope =
+            ActionHash::from_rule_and_record(&rule, &Action::AdjustConfig(a.clone()), &record);
+
+        state
+            .create_or_update_adaptive_override(
+                &scope,
+                &rule,
+                &record,
+                &a,
+                "example.com",
+                "unspecified",
+                PreferRollup::Yes,
+                &toml::Value::Integer(100),
+            )
+            .unwrap();
+
+        assert!(
+            state.adaptive_overrides.get(&scope).is_none(),
+            "an already-expired trigger should not create an override entry"
+        );
+    }
+
+    #[test]
+    fn test_create_or_update_adaptive_override_second_trigger_survives_parse_failure_on_existing_entry(
+    ) {
+        let state = TsaState::default();
+        let rule = simple_rule();
+        let a = adj("connection_limit", 10.0, 25.0, 10.0);
+        let record = make_record(Utc::now());
+        let scope =
+            ActionHash::from_rule_and_record(&rule, &Action::AdjustConfig(a.clone()), &record);
+
+        // First trigger: valid value, seeds the entry (100 -> 90).
+        state
+            .create_or_update_adaptive_override(
+                &scope,
+                &rule,
+                &record,
+                &a,
+                "example.com",
+                "unspecified",
+                PreferRollup::Yes,
+                &toml::Value::Integer(100),
+            )
+            .unwrap();
+        assert_eq!(
+            state.adaptive_overrides.get(&scope).unwrap().current_limit,
+            90
+        );
+
+        // Second trigger: an original_value that would fail to parse as a
+        // connection_limit (LimitSpec rejects booleans). Since the entry
+        // already exists, parsing must be skipped entirely -- the call
+        // should still succeed (not propagate an Err that would abort the
+        // rest of the log record's other matched actions) and continue
+        // compounding from the existing current_limit.
+        let record = make_record(Utc::now());
+        state
+            .create_or_update_adaptive_override(
+                &scope,
+                &rule,
+                &record,
+                &a,
+                "example.com",
+                "unspecified",
+                PreferRollup::Yes,
+                &toml::Value::Boolean(true),
+            )
+            .expect("a parse failure on an already-existing entry must not propagate an error");
+        assert_eq!(
+            state.adaptive_overrides.get(&scope).unwrap().current_limit,
+            81
         );
     }
 
