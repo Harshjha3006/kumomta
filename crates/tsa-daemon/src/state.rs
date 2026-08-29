@@ -7,7 +7,7 @@ use anyhow::Context;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use kumo_api_types::shaping::{
-    Action, EgressPathConfigValue, EgressPathConfigValueUnchecked, Rule,
+    Action, EgressPathConfigAdjustment, EgressPathConfigValue, EgressPathConfigValueUnchecked, Rule,
 };
 use kumo_api_types::tsa::{ReadyQSuspension, SchedQBounce, SchedQSuspension};
 use kumo_log_types::JsonLogRecord;
@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
+use throttle::{LimitSpec, ThrottleSpec};
 
 pub static TSA_STATE: OnceLock<TsaState> = OnceLock::new();
 
@@ -165,6 +166,102 @@ pub struct ConfigurationOverride {
     pub expires: DateTime<Utc>,
 }
 
+/// Captures the non-`limit` parts of a scaled EgressPathConfig field's
+/// value, so that percentage math can operate purely on `u64` and the
+/// TOML value can be reconstructed exactly at export time.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum AdaptiveFieldTemplate {
+    Rate {
+        period: u64,
+        max_burst: Option<u64>,
+        force_local: bool,
+    },
+    Limit {
+        force_local: bool,
+    },
+}
+
+impl AdaptiveFieldTemplate {
+    pub fn to_toml_value(&self, limit: u64) -> toml::Value {
+        match self {
+            Self::Rate {
+                period,
+                max_burst,
+                force_local,
+            } => {
+                let spec = ThrottleSpec {
+                    limit,
+                    period: *period,
+                    max_burst: *max_burst,
+                    force_local: *force_local,
+                };
+                toml::Value::String(spec.to_string())
+            }
+            Self::Limit { force_local: true } => toml::Value::String(format!("local:{limit}")),
+            Self::Limit { force_local: false } => toml::Value::Integer(limit as i64),
+        }
+    }
+}
+
+/// Parse a raw TOML value for a supported AdjustConfig field into its
+/// numeric `limit` and the template needed to reconstruct the full value
+/// later. Returns an error for any field not in `ADAPTIVE_SUPPORTED_FIELDS`.
+pub fn parse_adaptive_field_value(
+    field_name: &str,
+    value: &toml::Value,
+) -> anyhow::Result<(u64, AdaptiveFieldTemplate)> {
+    use kumo_api_types::shaping::ADAPTIVE_SUPPORTED_FIELDS;
+    use serde::Deserialize;
+
+    match field_name {
+        "max_message_rate" | "max_connection_rate" | "source_selection_rate" => {
+            let spec = ThrottleSpec::deserialize(value.clone())
+                .with_context(|| format!("parsing {field_name} value {value:?} as ThrottleSpec"))?;
+            Ok((
+                spec.limit,
+                AdaptiveFieldTemplate::Rate {
+                    period: spec.period,
+                    max_burst: spec.max_burst,
+                    force_local: spec.force_local,
+                },
+            ))
+        }
+        "connection_limit" => {
+            let spec = LimitSpec::deserialize(value.clone())
+                .with_context(|| format!("parsing {field_name} value {value:?} as LimitSpec"))?;
+            Ok((
+                spec.limit,
+                AdaptiveFieldTemplate::Limit {
+                    force_local: spec.force_local,
+                },
+            ))
+        }
+        other => anyhow::bail!(
+            "unsupported AdjustConfig field {other:?}; supported fields are: {}",
+            ADAPTIVE_SUPPORTED_FIELDS.join(", ")
+        ),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdaptiveOverride {
+    pub domain: String,
+    pub mx_rollup: bool,
+    pub source: String,
+    pub reason: String,
+    pub field_name: String,
+    pub template: AdaptiveFieldTemplate,
+    pub original_limit: u64,
+    pub current_limit: u64,
+    pub decrease_percent: f64,
+    pub floor_percent: f64,
+    pub ramp_step_percent: f64,
+    pub ramp_up_interval_secs: i64,
+    pub safety_duration_secs: i64,
+    pub last_activity: DateTime<Utc>,
+    pub expires: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
 pub struct SchedQBounceKey {
     pub action_hash: ActionHash,
@@ -204,6 +301,7 @@ pub struct SchedQSuspensionEntry {
 pub struct TsaState {
     event_history: DashMap<MatchingScope, EventData>,
     config_overrides: DashMap<ActionHash, ConfigurationOverride>,
+    adaptive_overrides: DashMap<ActionHash, AdaptiveOverride>,
     schedq_bounces: DashMap<SchedQBounceKey, SchedQBounceEntry>,
     readyq_suspensions: DashMap<ActionHash, ReadyQSuspensionEntry>,
     schedq_suspensions: DashMap<SchedQSuspensionKey, SchedQSuspensionEntry>,
@@ -215,6 +313,8 @@ struct SerializableState {
     event_history: HashMap<MatchingScope, EventData>,
     #[serde(default)]
     config_overrides: HashMap<ActionHash, ConfigurationOverride>,
+    #[serde(default)]
+    adaptive_overrides: HashMap<ActionHash, AdaptiveOverride>,
     #[serde(default)]
     schedq_bounces: HashMap<SchedQBounceKey, SchedQBounceEntry>,
     #[serde(default)]
@@ -273,6 +373,63 @@ impl TsaState {
 
         tracing::debug!("new config override {scope:?} = {over:?}");
         self.config_overrides.insert(scope, over);
+    }
+
+    /// Apply the down-path of an AdjustConfig/AdjustDomainConfig action:
+    /// create the override entry on first trigger (seeding it from
+    /// `original_value`), or compound the existing entry's current value
+    /// down by `decrease_percent`, clamped at `floor_percent` of the
+    /// original value.
+    pub fn create_or_update_adaptive_override(
+        &self,
+        scope: &ActionHash,
+        rule: &Rule,
+        record: &JsonLogRecord,
+        adj: &EgressPathConfigAdjustment,
+        domain: &str,
+        source: &str,
+        prefer_rollup: PreferRollup,
+        original_value: &toml::Value,
+    ) -> anyhow::Result<()> {
+        let (original_limit, template) = parse_adaptive_field_value(&adj.name, original_value)?;
+        let now = record.timestamp;
+
+        let mut entry = self
+            .adaptive_overrides
+            .entry(scope.clone())
+            .or_insert_with(|| AdaptiveOverride {
+                domain: domain.to_string(),
+                mx_rollup: match prefer_rollup {
+                    PreferRollup::Yes => rule.was_rollup,
+                    PreferRollup::No => false,
+                },
+                source: source.to_string(),
+                reason: format!("automation rule: {}", regex_list_to_string(&rule.regex)),
+                field_name: adj.name.clone(),
+                template,
+                original_limit,
+                current_limit: original_limit,
+                decrease_percent: adj.decrease_percent,
+                floor_percent: adj.floor_percent,
+                ramp_step_percent: adj.ramp_step_percent,
+                ramp_up_interval_secs: adj.ramp_up_interval.as_secs() as i64,
+                safety_duration_secs: rule.duration.as_secs() as i64,
+                last_activity: now,
+                expires: now + rule.duration,
+            });
+
+        let floor_limit = ((entry.original_limit as f64) * (entry.floor_percent / 100.0))
+            .round()
+            .max(1.0) as u64;
+        let decreased = ((entry.current_limit as f64) * (1.0 - entry.decrease_percent / 100.0))
+            .round()
+            .max(1.0) as u64;
+        entry.current_limit = decreased.max(floor_limit);
+        entry.last_activity = now;
+        entry.expires = now + rule.duration;
+
+        tracing::debug!("adaptive override down-step {scope:?} = {:?}", *entry);
+        Ok(())
     }
 
     pub fn insert_schedq_bounce(&self, key: SchedQBounceKey, bounce: SchedQBounceEntry) {
@@ -471,6 +628,11 @@ impl TsaState {
                 .collect(),
             config_overrides: self
                 .config_overrides
+                .iter()
+                .map(|entry| (entry.key().clone(), entry.value().clone()))
+                .collect(),
+            adaptive_overrides: self
+                .adaptive_overrides
                 .iter()
                 .map(|entry| (entry.key().clone(), entry.value().clone()))
                 .collect(),
@@ -730,6 +892,9 @@ pub async fn load_state() -> anyhow::Result<()> {
                     for (key, value) in loaded.config_overrides.into_iter() {
                         state.config_overrides.insert(key, value);
                     }
+                    for (key, value) in loaded.adaptive_overrides.into_iter() {
+                        state.adaptive_overrides.insert(key, value);
+                    }
                     for (key, value) in loaded.schedq_bounces.into_iter() {
                         state.schedq_bounces.insert(key, value);
                     }
@@ -902,5 +1067,194 @@ pub async fn state_pruner() -> anyhow::Result<()> {
             }
             last_save = Instant::now();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kumo_api_types::shaping::{
+        EgressPathConfigAdjustment, EgressPathConfigAdjustmentUnchecked,
+    };
+    use kumo_log_types::{JsonLogRecord, RecordType};
+    use rfc5321::Response;
+    use uuid::Uuid;
+
+    fn adj(
+        name: &str,
+        decrease_percent: f64,
+        floor_percent: f64,
+        ramp_step_percent: f64,
+    ) -> EgressPathConfigAdjustment {
+        EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
+            name: name.to_string(),
+            decrease_percent,
+            floor_percent,
+            ramp_step_percent: Some(ramp_step_percent),
+            ramp_up_interval: std::time::Duration::from_secs(900),
+        })
+        .unwrap()
+    }
+
+    fn make_record(timestamp: DateTime<Utc>) -> JsonLogRecord {
+        JsonLogRecord {
+            kind: RecordType::TransientFailure,
+            id: String::new(),
+            sender: String::new(),
+            recipient: vec!["user@example.com".to_string()],
+            queue: String::new(),
+            site: "mx.example.com@smtp_client".to_string(),
+            size: 0,
+            response: Response {
+                code: 421,
+                command: None,
+                enhanced_code: None,
+                content: String::new(),
+            },
+            peer_address: None,
+            timestamp,
+            created: timestamp,
+            num_attempts: 1,
+            bounce_classification: Default::default(),
+            egress_pool: None,
+            egress_source: None,
+            source_address: None,
+            feedback_report: None,
+            meta: Default::default(),
+            headers: Default::default(),
+            delivery_protocol: None,
+            reception_protocol: None,
+            nodeid: Uuid::default(),
+            tls_cipher: None,
+            tls_protocol_version: None,
+            tls_peer_subject_name: None,
+            provider_name: None,
+            session_id: None,
+        }
+    }
+
+    fn simple_rule() -> Rule {
+        toml::from_str(
+            r#"
+            regex = ["^4\\.7\\.0"]
+            trigger = "Immediate"
+            duration = "30m"
+            action = "Suspend"
+            "#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_parse_adaptive_field_value_rate() {
+        let (limit, template) = parse_adaptive_field_value(
+            "max_message_rate",
+            &toml::Value::String("1000/s".to_string()),
+        )
+        .unwrap();
+        assert_eq!(limit, 1000);
+        assert_eq!(
+            template,
+            AdaptiveFieldTemplate::Rate {
+                period: 1,
+                max_burst: None,
+                force_local: false
+            }
+        );
+        assert_eq!(
+            template.to_toml_value(900),
+            toml::Value::String("900/s".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_adaptive_field_value_limit() {
+        let (limit, template) =
+            parse_adaptive_field_value("connection_limit", &toml::Value::Integer(32)).unwrap();
+        assert_eq!(limit, 32);
+        assert_eq!(
+            template,
+            AdaptiveFieldTemplate::Limit { force_local: false }
+        );
+        assert_eq!(template.to_toml_value(28), toml::Value::Integer(28));
+    }
+
+    #[test]
+    fn test_parse_adaptive_field_value_rejects_unsupported_field() {
+        let err =
+            parse_adaptive_field_value("enable_tls", &toml::Value::Boolean(true)).unwrap_err();
+        assert!(err.to_string().contains("unsupported"), "{err}");
+    }
+
+    #[test]
+    fn test_down_path_compounds_and_clamps_to_floor() {
+        let state = TsaState::default();
+        let scope = ActionHash::from_rule_and_record(
+            &simple_rule(),
+            &Action::AdjustConfig(adj("max_message_rate", 10.0, 25.0, 10.0)),
+            &make_record(Utc::now()),
+        );
+        let rule = simple_rule();
+        let a = adj("max_message_rate", 10.0, 25.0, 10.0);
+        let original = toml::Value::String("1000/s".to_string());
+
+        // First trigger: 1000 -> 900
+        let record = make_record(Utc::now());
+        state
+            .create_or_update_adaptive_override(
+                &scope,
+                &rule,
+                &record,
+                &a,
+                "example.com",
+                "unspecified",
+                PreferRollup::Yes,
+                &original,
+            )
+            .unwrap();
+        assert_eq!(
+            state.adaptive_overrides.get(&scope).unwrap().current_limit,
+            900
+        );
+
+        // Second trigger: 900 -> 810
+        let record = make_record(Utc::now());
+        state
+            .create_or_update_adaptive_override(
+                &scope,
+                &rule,
+                &record,
+                &a,
+                "example.com",
+                "unspecified",
+                PreferRollup::Yes,
+                &original,
+            )
+            .unwrap();
+        assert_eq!(
+            state.adaptive_overrides.get(&scope).unwrap().current_limit,
+            810
+        );
+
+        // Floor is 25% of 1000 = 250. Trigger repeatedly until it clamps.
+        for _ in 0..20 {
+            let record = make_record(Utc::now());
+            state
+                .create_or_update_adaptive_override(
+                    &scope,
+                    &rule,
+                    &record,
+                    &a,
+                    "example.com",
+                    "unspecified",
+                    PreferRollup::Yes,
+                    &original,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            state.adaptive_overrides.get(&scope).unwrap().current_limit,
+            250
+        );
     }
 }
