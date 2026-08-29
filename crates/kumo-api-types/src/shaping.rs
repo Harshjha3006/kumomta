@@ -257,20 +257,20 @@ impl TryFrom<EgressPathConfigAdjustmentUnchecked> for EgressPathConfigAdjustment
                 ADAPTIVE_SUPPORTED_FIELDS.join(", ")
             );
         }
-        if !(u.decrease_percent > 0.0 && u.decrease_percent <= 100.0) {
+        if u.decrease_percent.is_nan() || u.decrease_percent <= 0.0 || u.decrease_percent > 100.0 {
             anyhow::bail!(
                 "decrease_percent must be > 0 and <= 100, got {}",
                 u.decrease_percent
             );
         }
-        if !(u.floor_percent >= 0.0 && u.floor_percent < 100.0) {
+        if u.floor_percent.is_nan() || u.floor_percent < 0.0 || u.floor_percent >= 100.0 {
             anyhow::bail!(
                 "floor_percent must be >= 0 and < 100, got {}",
                 u.floor_percent
             );
         }
         let ramp_step_percent = u.ramp_step_percent.unwrap_or(u.decrease_percent);
-        if !(ramp_step_percent > 0.0) {
+        if ramp_step_percent.is_nan() || ramp_step_percent <= 0.0 {
             anyhow::bail!("ramp_step_percent must be > 0, got {ramp_step_percent}");
         }
         if u.ramp_up_interval.is_zero() {

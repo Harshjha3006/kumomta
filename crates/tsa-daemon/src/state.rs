@@ -7,7 +7,8 @@ use anyhow::Context;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use kumo_api_types::shaping::{
-    Action, EgressPathConfigAdjustment, EgressPathConfigValue, EgressPathConfigValueUnchecked, Rule,
+    Action, EgressPathConfigAdjustment, EgressPathConfigValue, EgressPathConfigValueUnchecked,
+    Rule, ADAPTIVE_SUPPORTED_FIELDS,
 };
 use kumo_api_types::tsa::{ReadyQSuspension, SchedQBounce, SchedQSuspension};
 use kumo_log_types::JsonLogRecord;
@@ -210,9 +211,6 @@ pub fn parse_adaptive_field_value(
     field_name: &str,
     value: &toml::Value,
 ) -> anyhow::Result<(u64, AdaptiveFieldTemplate)> {
-    use kumo_api_types::shaping::ADAPTIVE_SUPPORTED_FIELDS;
-    use serde::Deserialize;
-
     match field_name {
         "max_message_rate" | "max_connection_rate" | "source_selection_rate" => {
             let spec = ThrottleSpec::deserialize(value.clone())
@@ -925,6 +923,23 @@ impl TsaState {
         let start = Instant::now();
         let now_ts = to_unix_ts(now);
 
+        // Cheap, read-only pre-filter: most entries in steady state are
+        // simply waiting out their ramp_up_interval, so deciding that here
+        // (during the read-only iteration below) avoids a remove_if +
+        // get_mut (two DashMap write-lock attempts) per idle entry on every
+        // 60s tick -- only entries that are actually due get carried into
+        // the write-locking phase.
+        let is_actionable = |over: &AdaptiveOverride| {
+            if *now >= over.expires {
+                return true;
+            }
+            if over.current_limit >= over.original_limit {
+                return false;
+            }
+            let last_activity_ts = to_unix_ts(&over.last_activity);
+            now_ts - last_activity_ts >= over.ramp_up_interval_secs
+        };
+
         // Re-evaluated fresh at the moment of each DashMap call below (never
         // from a snapshot captured during the scan), so a concurrent
         // create_or_update_adaptive_override (the down-path) landing on the
@@ -958,9 +973,9 @@ impl TsaState {
         let keys: Vec<ActionHash> = self
             .adaptive_overrides
             .iter()
-            .map(|entry| {
+            .filter_map(|entry| {
                 visited += 1;
-                entry.key().clone()
+                is_actionable(entry.value()).then(|| entry.key().clone())
             })
             .collect();
 
