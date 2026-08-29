@@ -39,3 +39,8 @@ enable_tls = "OpportunisticInsecure"
 regex = "OK ids="
 action = "Suspend"
 duration = "1 hour"
+
+[["delivery.mx-sink.wezfurlong.org".automation]]
+regex = "you said 450-adjust-connlimit"
+action = {AdjustConfig={name="connection_limit", decrease_percent=50, floor_percent=25, ramp_up_interval="5m"}}
+duration = "1 hour"

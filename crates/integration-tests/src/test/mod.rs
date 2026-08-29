@@ -66,6 +66,7 @@ mod tls_client_certificate;
 mod tls_info_log;
 mod tls_opportunistic_fail;
 mod tls_opportunistic_reconnect;
+mod tsa_adjust_config_automation;
 mod tsa_basic_automation;
 mod tsa_bounce_automation;
 mod tsa_bounce_campaign;
