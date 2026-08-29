@@ -830,51 +830,73 @@ impl TsaState {
         let start = Instant::now();
         let now_ts = to_unix_ts(now);
 
-        let mut to_remove: Vec<ActionHash> = vec![];
-        let mut to_step: Vec<(ActionHash, u64)> = vec![];
-
-        for entry in self.adaptive_overrides.iter() {
-            visited += 1;
-            let key = entry.key().clone();
-            let over = entry.value();
-
+        // Re-evaluated fresh at the moment of each DashMap call below (never
+        // from a snapshot captured during the scan), so a concurrent
+        // create_or_update_adaptive_override (the down-path) landing on the
+        // same key between our scan and our mutate can't be clobbered by a
+        // stale step or have its just-refreshed `expires` ignored.
+        let is_removable = |over: &AdaptiveOverride| {
             if *now >= over.expires {
-                to_remove.push(key);
-                continue;
+                return true;
             }
-
             if over.current_limit >= over.original_limit {
-                continue;
+                return false;
             }
-
             let last_activity_ts = to_unix_ts(&over.last_activity);
             if now_ts - last_activity_ts < over.ramp_up_interval_secs {
-                continue;
+                return false;
             }
-
             let increased = ((over.current_limit as f64) * (1.0 + over.ramp_step_percent / 100.0))
                 .round()
                 .max(1.0) as u64;
+            increased >= over.original_limit
+        };
 
-            if increased >= over.original_limit {
-                to_remove.push(key);
-            } else {
-                to_step.push((key, increased));
-            }
-        }
+        let keys: Vec<ActionHash> = self
+            .adaptive_overrides
+            .iter()
+            .map(|entry| {
+                visited += 1;
+                entry.key().clone()
+            })
+            .collect();
 
         let mut num_removed = 0;
-        for key in to_remove {
-            if self.adaptive_overrides.remove(&key).is_some() {
-                num_removed += 1;
-            }
-        }
-
         let mut num_stepped = 0;
-        for (key, new_limit) in to_step {
+
+        for key in keys {
+            if self
+                .adaptive_overrides
+                .remove_if(&key, |_key, over| is_removable(over))
+                .is_some()
+            {
+                num_removed += 1;
+                continue;
+            }
+
+            // Not removed: re-fetch and recompute the step decision entirely
+            // from live state (not the scan snapshot) before mutating.
             if let Some(mut entry) = self.adaptive_overrides.get_mut(&key) {
+                if entry.current_limit >= entry.original_limit {
+                    continue;
+                }
+                let last_activity_ts = to_unix_ts(&entry.last_activity);
+                if now_ts - last_activity_ts < entry.ramp_up_interval_secs {
+                    continue;
+                }
+                let increased = ((entry.current_limit as f64)
+                    * (1.0 + entry.ramp_step_percent / 100.0))
+                    .round()
+                    .max(1.0) as u64;
+                if increased >= entry.original_limit {
+                    // Extremely narrow window: became eligible for full
+                    // recovery between the remove_if check above and this
+                    // get_mut. Leave it for the next tick (60s later) rather
+                    // than removing here without an atomic re-check.
+                    continue;
+                }
                 let safety = entry.safety_duration_secs.max(0) as u64;
-                entry.current_limit = new_limit;
+                entry.current_limit = increased;
                 entry.last_activity = *now;
                 entry.expires = *now + std::time::Duration::from_secs(safety);
                 num_stepped += 1;
