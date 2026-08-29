@@ -227,3 +227,33 @@ The following new actions are now supported:
    both the same destination domain, *tenant* AND *campaign* as the triggering
    record.  If no campaign was assigned, behave as though `"BounceTenant"` was
    the action.
+
+{{since('dev')}}
+
+The following new actions are now supported:
+
+ * `{AdjustConfig{name="NAME", decrease_percent=N, floor_percent=N, ramp_step_percent=N, ramp_up_interval="DURATION"}}` -
+   define a *relative* configuration adjustment: each time the rule triggers,
+   `NAME` is decreased by `decrease_percent` percent of its current value
+   (compounding on repeated triggers), never going below `floor_percent`
+   percent of its original configured value. Once the rule stops triggering
+   for `ramp_up_interval`, the value is stepped back up by
+   `ramp_step_percent` percent, repeating until it reaches its original
+   value, at which point the override is removed. `ramp_step_percent`
+   defaults to `decrease_percent` if omitted. Only numeric rate/limit
+   fields are supported: `max_message_rate`, `max_connection_rate`,
+   `source_selection_rate`, and `connection_limit`.
+ * `{AdjustDomainConfig{name="NAME", decrease_percent=N, floor_percent=N, ramp_step_percent=N, ramp_up_interval="DURATION"}}` -
+   same as `AdjustConfig`, but with `mx_rollup=false`, even if the rule was
+   defined inside a domain where `mx_rollup=true`.
+
+For example, to cut `max_message_rate` by 10% each time Yahoo returns a
+`[TS02]` unusual-traffic response, with a floor of 25% of the original
+rate, ramping back up by 10% every 15 minutes of quiet:
+
+{% call toml_data() %}
+[["yahoo.com".automation]]
+regex = "\\[TS02\\]"
+action = {AdjustConfig={name="max_message_rate", decrease_percent=10, floor_percent=25, ramp_up_interval="15m"}}
+duration = "30m"
+{% endcall %}

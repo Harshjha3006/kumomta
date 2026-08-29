@@ -143,6 +143,35 @@ duration = "2 hours"
 
 The full set of Traffic Shaping Automation actions is available on the [traffic shaping](../../reference/kumo.shaping/load.md#traffic-shaping-automation-rules) page of the Reference Manual.
 
+### Gradually Recovering from a Throttle
+
+`SetConfig` pins a value; if you'd rather ease off when an ISP starts
+complaining and then ease back up automatically once things are quiet,
+use `AdjustConfig` (or `AdjustDomainConfig` for `mx_rollup=false`
+semantics) instead:
+
+{% call toml_data() %}
+[["yahoo.com".automation]]
+regex = "\\[TS02\\]"
+action = {AdjustConfig={name="max_message_rate", decrease_percent=10, floor_percent=25, ramp_up_interval="15m"}}
+duration = "30m"
+{% endcall %}
+
+Each time this rule matches, `max_message_rate` is cut by 10% of its
+current value (compounding if it matches again while already reduced),
+down to a floor of 25% of the domain's originally configured rate. Once
+15 minutes pass with no further matches, the rate is stepped back up by
+10%, repeating until it's back to the original value. You can monitor
+the current state of any in-progress ramp via:
+
+```console
+$ curl http://127.0.0.1:8008/get_config_v1/shaping.toml
+```
+
+which annotates each adjusted field with its original value, how far
+below original it currently is, and when the next ramp-up step is
+eligible.
+
 ## Monitoring the TSA Daemon
 
 Adjustments to the traffic shaping rules are achieved by creating a custom `shaping.toml` file that is maintained by the TSA daemon and loaded as an overlay on the existing `shaping.toml file created by the user.
