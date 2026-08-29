@@ -9191,6 +9191,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sqlite",
+ "tempfile",
  "throttle",
  "tikv-jemalloc-sys",
  "tikv-jemallocator",

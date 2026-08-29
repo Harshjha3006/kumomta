@@ -391,32 +391,57 @@ impl TsaState {
         prefer_rollup: PreferRollup,
         original_value: &toml::Value,
     ) -> anyhow::Result<()> {
-        let (original_limit, template) = parse_adaptive_field_value(&adj.name, original_value)?;
         let now = record.timestamp;
+        let expires = now + rule.duration;
 
-        let mut entry = self
-            .adaptive_overrides
-            .entry(scope.clone())
-            .or_insert_with(|| AdaptiveOverride {
-                domain: domain.to_string(),
-                mx_rollup: match prefer_rollup {
-                    PreferRollup::Yes => rule.was_rollup,
-                    PreferRollup::No => false,
-                },
-                source: source.to_string(),
-                reason: format!("automation rule: {}", regex_list_to_string(&rule.regex)),
-                field_name: adj.name.clone(),
-                template,
-                original_limit,
-                current_limit: original_limit,
-                decrease_percent: adj.decrease_percent,
-                floor_percent: adj.floor_percent,
-                ramp_step_percent: adj.ramp_step_percent,
-                ramp_up_interval_secs: adj.ramp_up_interval.as_secs() as i64,
-                safety_duration_secs: rule.duration.as_secs() as i64,
-                last_activity: now,
-                expires: now + rule.duration,
-            });
+        if Utc::now() >= expires {
+            // Skip already expired entry, same as the sibling insert_*
+            // methods in this file. This is currently redundant with the
+            // caller's own pre-filtering in http_server.rs, but the
+            // invariant should be enforced locally here too rather than
+            // solely relied upon from the caller.
+            return Ok(());
+        }
+
+        // Parsing `original_value` is only needed to seed a brand new
+        // entry: an already-existing entry carries its own
+        // original_limit/template, so a parse failure on a later trigger
+        // must not abort processing of the rest of this record's other
+        // matched actions (consistent with the "log-and-skip" intent
+        // documented on the "no base value" branch in
+        // http_server.rs::apply_adjust_config).
+        if !self.adaptive_overrides.contains_key(scope) {
+            let (original_limit, template) = parse_adaptive_field_value(&adj.name, original_value)?;
+            self.adaptive_overrides
+                .entry(scope.clone())
+                .or_insert_with(|| AdaptiveOverride {
+                    domain: domain.to_string(),
+                    mx_rollup: match prefer_rollup {
+                        PreferRollup::Yes => rule.was_rollup,
+                        PreferRollup::No => false,
+                    },
+                    source: source.to_string(),
+                    reason: format!("automation rule: {}", regex_list_to_string(&rule.regex)),
+                    field_name: adj.name.clone(),
+                    template,
+                    original_limit,
+                    current_limit: original_limit,
+                    decrease_percent: adj.decrease_percent,
+                    floor_percent: adj.floor_percent,
+                    ramp_step_percent: adj.ramp_step_percent,
+                    ramp_up_interval_secs: adj.ramp_up_interval.as_secs() as i64,
+                    safety_duration_secs: rule.duration.as_secs() as i64,
+                    last_activity: now,
+                    expires,
+                });
+        }
+
+        let Some(mut entry) = self.adaptive_overrides.get_mut(scope) else {
+            // Extremely narrow race: the entry we just confirmed/inserted
+            // was concurrently removed (e.g. by the prune tick) before we
+            // could grab it. Nothing further to do for this trigger.
+            return Ok(());
+        };
 
         let floor_limit = ((entry.original_limit as f64) * (entry.floor_percent / 100.0))
             .round()
@@ -426,7 +451,7 @@ impl TsaState {
             .max(1.0) as u64;
         entry.current_limit = decreased.max(floor_limit);
         entry.last_activity = now;
-        entry.expires = now + rule.duration;
+        entry.expires = expires;
 
         tracing::debug!("adaptive override down-step {scope:?} = {:?}", *entry);
         Ok(())
@@ -655,12 +680,20 @@ impl TsaState {
             source_entry.insert(&over.field_name, Item::Value(item));
 
             if let Some(mut key) = source_entry.key_mut(&over.field_name) {
-                let percent_below =
-                    100.0 * (1.0 - (over.current_limit as f64 / over.original_limit as f64));
-                let next_step_at = over.last_activity
-                    + chrono::Duration::seconds(over.ramp_up_interval_secs);
+                // Guard against dividing by zero: an original_limit of 0
+                // would otherwise produce NaN/-inf in the comment below.
+                let percent_below = if over.original_limit > 0 {
+                    format!(
+                        "{:.1}% below original",
+                        100.0 * (1.0 - (over.current_limit as f64 / over.original_limit as f64))
+                    )
+                } else {
+                    "N/A".to_string()
+                };
+                let next_step_at =
+                    over.last_activity + chrono::Duration::seconds(over.ramp_up_interval_secs);
                 key.leaf_decor_mut().set_prefix(format!(
-                    "# reason: {}\n# original: {}, {:.1}% below original\n\
+                    "# reason: {}\n# original: {}, {}\n\
                      # next step eligible at: {}\n",
                     over.reason,
                     over.original_limit,
@@ -911,6 +944,14 @@ impl TsaState {
             let increased = ((over.current_limit as f64) * (1.0 + over.ramp_step_percent / 100.0))
                 .round()
                 .max(1.0) as u64;
+            // Guarantee monotonic upward progress: on small integer limits
+            // (e.g. current_limit=3, ramp_step_percent=10 -> 3*1.10=3.3
+            // rounds back down to 3), naive rounding can otherwise leave
+            // the value unchanged forever, stalling the ramp-up and
+            // leaking this entry (it never reaches original_limit, but
+            // the tick still refreshes `expires` every time via the step
+            // branch, so the safety-net expiry never fires either).
+            let increased = increased.max(over.current_limit + 1);
             increased >= over.original_limit
         };
 
@@ -950,6 +991,11 @@ impl TsaState {
                     * (1.0 + entry.ramp_step_percent / 100.0))
                     .round()
                     .max(1.0) as u64;
+                // Keep in lockstep with the identical guard in the
+                // `is_removable` closure above: guarantee monotonic
+                // upward progress even when naive rounding would
+                // otherwise stall on small integer limits.
+                let increased = increased.max(entry.current_limit + 1);
                 if increased >= entry.original_limit {
                     // Extremely narrow window: became eligible for full
                     // recovery between the remove_if check above and this
@@ -1331,6 +1377,21 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_adaptive_field_value_limit_force_local() {
+        let (limit, template) = parse_adaptive_field_value(
+            "connection_limit",
+            &toml::Value::String("local:32".to_string()),
+        )
+        .unwrap();
+        assert_eq!(limit, 32);
+        assert_eq!(template, AdaptiveFieldTemplate::Limit { force_local: true });
+        assert_eq!(
+            template.to_toml_value(28),
+            toml::Value::String("local:28".to_string())
+        );
+    }
+
+    #[test]
     fn test_parse_adaptive_field_value_rejects_unsupported_field() {
         let err =
             parse_adaptive_field_value("enable_tls", &toml::Value::Boolean(true)).unwrap_err();
@@ -1462,6 +1523,73 @@ mod tests {
         assert_eq!(
             state.adaptive_overrides.get(&scope).unwrap().current_limit,
             88
+        );
+    }
+
+    /// Regression test for a stall bug on small integer limits: with
+    /// original_limit=10, floor_percent=25 (floor=3) and
+    /// ramp_step_percent=10, naive rounding of `3 * 1.10 = 3.3` rounds
+    /// back down to 3, so the ramp-up step made no progress and the
+    /// entry never reached original_limit -- nor got pruned by the
+    /// safety-net expiry, since the step branch kept refreshing
+    /// `expires` on every tick even though nothing actually changed. The
+    /// fix forces each step to be strictly greater than the prior
+    /// current_limit, guaranteeing forward progress every tick.
+    #[tokio::test]
+    async fn test_up_path_progresses_on_small_integer_limits() {
+        let state = TsaState::default();
+        let record = make_record(Utc::now());
+        let rule = simple_rule();
+        // decrease_percent=100 so a single down-step trigger drives
+        // current_limit straight to the floor.
+        let a = adj("connection_limit", 100.0, 25.0, 10.0);
+        let original = toml::Value::Integer(10);
+        let scope =
+            ActionHash::from_rule_and_record(&rule, &Action::AdjustConfig(a.clone()), &record);
+
+        state
+            .create_or_update_adaptive_override(
+                &scope,
+                &rule,
+                &record,
+                &a,
+                "example.com",
+                "unspecified",
+                PreferRollup::Yes,
+                &original,
+            )
+            .unwrap();
+        // floor = round(10 * 0.25) = 3
+        assert_eq!(
+            state.adaptive_overrides.get(&scope).unwrap().current_limit,
+            3
+        );
+
+        let mut last_seen = 3u64;
+        for _ in 0..40 {
+            if state.adaptive_overrides.get(&scope).is_none() {
+                break;
+            }
+            {
+                let mut entry = state.adaptive_overrides.get_mut(&scope).unwrap();
+                entry.last_activity = Utc::now() - chrono::Duration::seconds(1000);
+            }
+            let now = Utc::now();
+            state.prune_adaptive_overrides(&now, false).await;
+
+            if let Some(entry) = state.adaptive_overrides.get(&scope) {
+                assert!(
+                    entry.current_limit > last_seen,
+                    "ramp-up stalled at {last_seen}: made no progress on this tick"
+                );
+                last_seen = entry.current_limit;
+            }
+        }
+
+        assert!(
+            state.adaptive_overrides.get(&scope).is_none(),
+            "entry should have fully recovered to original_limit and been removed, \
+             but is stuck at current_limit={last_seen}"
         );
     }
 

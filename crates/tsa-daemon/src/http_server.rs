@@ -980,3 +980,132 @@ pub async fn subscribe_event_v1(ws: WebSocketUpgrade) -> impl IntoResponse {
 async fn tsa_status() -> &'static str {
     "TSA Daemon OK"
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kumo_api_types::shaping::{EgressPathConfigAdjustmentUnchecked, ShapingMergeOptions};
+    use kumo_log_types::RecordType;
+    use rfc5321::Response;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+    use uuid::Uuid;
+
+    fn adj(name: &str) -> EgressPathConfigAdjustment {
+        EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
+            name: name.to_string(),
+            decrease_percent: 10.0,
+            floor_percent: 25.0,
+            ramp_step_percent: Some(10.0),
+            ramp_up_interval: std::time::Duration::from_secs(900),
+        })
+        .unwrap()
+    }
+
+    fn make_record(recipient: &str, site: &str) -> JsonLogRecord {
+        JsonLogRecord {
+            kind: RecordType::TransientFailure,
+            id: String::new(),
+            sender: String::new(),
+            recipient: vec![recipient.to_string()],
+            queue: String::new(),
+            site: site.to_string(),
+            size: 0,
+            response: Response {
+                code: 421,
+                command: None,
+                enhanced_code: None,
+                content: String::new(),
+            },
+            peer_address: None,
+            timestamp: Utc::now(),
+            created: Utc::now(),
+            num_attempts: 1,
+            bounce_classification: Default::default(),
+            egress_pool: None,
+            egress_source: None,
+            source_address: None,
+            feedback_report: None,
+            meta: Default::default(),
+            headers: Default::default(),
+            delivery_protocol: None,
+            reception_protocol: None,
+            nodeid: Uuid::default(),
+            tls_cipher: None,
+            tls_protocol_version: None,
+            tls_peer_subject_name: None,
+            provider_name: None,
+            session_id: None,
+        }
+    }
+
+    fn simple_rule() -> Rule {
+        toml::from_str(
+            r#"
+            regex = ["^4\\.7\\.0"]
+            trigger = "Immediate"
+            duration = "30m"
+            action = "Suspend"
+            "#,
+        )
+        .unwrap()
+    }
+
+    async fn make_shaping(inputs: &[&str]) -> Shaping {
+        let mut files = vec![];
+        let mut file_names = vec![];
+
+        for (i, content) in inputs.iter().enumerate() {
+            let mut shaping_file = NamedTempFile::with_prefix(format!("file{i}")).unwrap();
+            shaping_file.write_all(content.as_bytes()).unwrap();
+            file_names.push(shaping_file.path().to_str().unwrap().to_string());
+            files.push(shaping_file);
+        }
+
+        Shaping::merge_files(&file_names, &ShapingMergeOptions::default())
+            .await
+            .unwrap()
+    }
+
+    /// Covers the "no base value, skip" branch of apply_adjust_config for
+    /// a rate field (max_message_rate/max_connection_rate/
+    /// source_selection_rate): when the merged shaping config has no
+    /// entry for the field, the function must log-and-return Ok(())
+    /// rather than treating it as an error or falling back to a default
+    /// (unlike connection_limit, rate fields have no meaningful
+    /// "unset" default).
+    ///
+    /// This also implicitly verifies that the function does not reach
+    /// TSA_STATE on this path: TSA_STATE is never initialized in this
+    /// test process, so `TSA_STATE.get().expect(...)` would panic if
+    /// apply_adjust_config incorrectly proceeded past the "no base
+    /// value" branch.
+    #[tokio::test]
+    async fn test_apply_adjust_config_skips_when_no_base_rate_value() {
+        let shaping = make_shaping(&[r#"
+["example.com"]
+mx_rollup = false
+        "#])
+        .await;
+
+        let rule = simple_rule();
+        let a = adj("max_message_rate");
+        let record = make_record("user@example.com", "mx.example.com@smtp_client");
+        let action_hash =
+            ActionHash::from_rule_and_record(&rule, &Action::AdjustConfig(a.clone()), &record);
+
+        let result = apply_adjust_config(
+            &action_hash,
+            &rule,
+            &record,
+            &a,
+            "example.com",
+            "unspecified",
+            PreferRollup::Yes,
+            &shaping,
+        )
+        .await;
+
+        assert!(result.is_ok(), "{result:?}");
+    }
+}
