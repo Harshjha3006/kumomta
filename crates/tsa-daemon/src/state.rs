@@ -1680,15 +1680,19 @@ mod tests {
         let rule = simple_rule();
         let a = adj("connection_limit", 20.0, 25.0, 10.0);
         let original = toml::Value::Integer(100);
-        let scope = ActionHash::from_rule_and_record(
-            &rule,
-            &Action::AdjustConfig(a.clone()),
-            &record,
-        );
+        let scope =
+            ActionHash::from_rule_and_record(&rule, &Action::AdjustConfig(a.clone()), &record);
 
         state
             .create_or_update_adaptive_override(
-                &scope, &rule, &record, &a, "example.com", "unspecified", PreferRollup::Yes, &original,
+                &scope,
+                &rule,
+                &record,
+                &a,
+                "example.com",
+                "unspecified",
+                PreferRollup::Yes,
+                &original,
             )
             .unwrap();
 

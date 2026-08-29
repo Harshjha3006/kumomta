@@ -2646,13 +2646,14 @@ MergedEntry {
 
     #[test]
     fn test_adjust_config_rejects_out_of_range_percentages() {
-        let bad_decrease = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
-            name: "max_message_rate".to_string(),
-            decrease_percent: 0.0,
-            floor_percent: 25.0,
-            ramp_step_percent: None,
-            ramp_up_interval: std::time::Duration::from_secs(900),
-        });
+        let bad_decrease =
+            EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
+                name: "max_message_rate".to_string(),
+                decrease_percent: 0.0,
+                floor_percent: 25.0,
+                ramp_step_percent: None,
+                ramp_up_interval: std::time::Duration::from_secs(900),
+            });
         assert!(bad_decrease.is_err());
 
         let bad_floor = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
@@ -2664,13 +2665,14 @@ MergedEntry {
         });
         assert!(bad_floor.is_err());
 
-        let zero_interval = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
-            name: "max_message_rate".to_string(),
-            decrease_percent: 10.0,
-            floor_percent: 25.0,
-            ramp_step_percent: None,
-            ramp_up_interval: std::time::Duration::from_secs(0),
-        });
+        let zero_interval =
+            EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
+                name: "max_message_rate".to_string(),
+                decrease_percent: 10.0,
+                floor_percent: 25.0,
+                ramp_step_percent: None,
+                ramp_up_interval: std::time::Duration::from_secs(0),
+            });
         assert!(zero_interval.is_err());
     }
 
