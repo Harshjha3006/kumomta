@@ -12,8 +12,8 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use kumo_api_types::egress_path::EgressPathConfig;
 use kumo_api_types::shaping::{
-    site_name_from_record, Action, EgressPathConfigAdjustment, EgressPathConfigValueUnchecked,
-    Regex, Rule, Shaping, Trigger,
+    Action, EgressPathConfigAdjustment, EgressPathConfigValueUnchecked, Regex, Rule, Shaping,
+    Trigger,
 };
 use kumo_api_types::tsa::{
     ReadyQSuspension, SchedQBounce, SchedQSuspension, SubscriptionItem, SuspensionEntry,
@@ -286,7 +286,17 @@ async fn apply_adjust_config(
     prefer_rollup: PreferRollup,
     shaping: &Shaping,
 ) -> anyhow::Result<()> {
-    let site_name = site_name_from_record(record);
+    // record.site is poorly named; it is really an identifier for the
+    // egress path. For matching purposes, we want just the site_name
+    // in the form produced by our MX resolution process.
+    // NOTE: this is coupled with the logic in
+    // ReadyQueueManager::compute_queue_name, and mirrors the equivalent
+    // computation in ShapingInner::match_rules.
+    let site_name = record
+        .site
+        .trim_start_matches(&format!("{source}->"))
+        .trim_end_matches("@smtp_client")
+        .to_string();
     let merged = shaping
         .get_egress_path_config_value(domain, source, &site_name)
         .await?;
