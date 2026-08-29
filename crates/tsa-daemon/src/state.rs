@@ -659,6 +659,7 @@ impl TsaState {
         let now_ts = to_unix_ts(&now);
         self.prune_events(now_ts, verbose).await;
         self.prune_config_overrides(&now, verbose).await;
+        self.prune_adaptive_overrides(&now, verbose).await;
         self.prune_readyq_suspensions(&now, verbose).await;
         self.prune_schedq_suspensions(&now, verbose).await;
         self.prune_schedq_bounces(&now, verbose).await;
@@ -820,6 +821,72 @@ impl TsaState {
         tracing::debug!(
             "visited {visited} and pruned {num_pruned} \
             config_overrides entries in {:?}",
+            start.elapsed()
+        );
+    }
+
+    async fn prune_adaptive_overrides(&self, now: &DateTime<Utc>, verbose: bool) {
+        let mut visited = 0;
+        let start = Instant::now();
+        let now_ts = to_unix_ts(now);
+
+        let mut to_remove: Vec<ActionHash> = vec![];
+        let mut to_step: Vec<(ActionHash, u64)> = vec![];
+
+        for entry in self.adaptive_overrides.iter() {
+            visited += 1;
+            let key = entry.key().clone();
+            let over = entry.value();
+
+            if *now >= over.expires {
+                to_remove.push(key);
+                continue;
+            }
+
+            if over.current_limit >= over.original_limit {
+                continue;
+            }
+
+            let last_activity_ts = to_unix_ts(&over.last_activity);
+            if now_ts - last_activity_ts < over.ramp_up_interval_secs {
+                continue;
+            }
+
+            let increased = ((over.current_limit as f64) * (1.0 + over.ramp_step_percent / 100.0))
+                .round()
+                .max(1.0) as u64;
+
+            if increased >= over.original_limit {
+                to_remove.push(key);
+            } else {
+                to_step.push((key, increased));
+            }
+        }
+
+        let mut num_removed = 0;
+        for key in to_remove {
+            if self.adaptive_overrides.remove(&key).is_some() {
+                num_removed += 1;
+            }
+        }
+
+        let mut num_stepped = 0;
+        for (key, new_limit) in to_step {
+            if let Some(mut entry) = self.adaptive_overrides.get_mut(&key) {
+                let safety = entry.safety_duration_secs.max(0) as u64;
+                entry.current_limit = new_limit;
+                entry.last_activity = *now;
+                entry.expires = *now + std::time::Duration::from_secs(safety);
+                num_stepped += 1;
+            }
+        }
+
+        if verbose && (num_removed > 0 || num_stepped > 0) {
+            tracing::info!("Adaptive overrides: {num_stepped} stepped up, {num_removed} removed");
+        }
+        tracing::debug!(
+            "visited {visited}, stepped {num_stepped}, removed {num_removed} \
+            adaptive_overrides in {:?}",
             start.elapsed()
         );
     }
@@ -1256,5 +1323,126 @@ mod tests {
             state.adaptive_overrides.get(&scope).unwrap().current_limit,
             250
         );
+    }
+
+    #[tokio::test]
+    async fn test_up_path_steps_and_resets_last_activity() {
+        let state = TsaState::default();
+        let record = make_record(Utc::now());
+        let rule = simple_rule();
+        let a = adj("connection_limit", 20.0, 25.0, 10.0);
+        let original = toml::Value::Integer(100);
+        let scope =
+            ActionHash::from_rule_and_record(&rule, &Action::AdjustConfig(a.clone()), &record);
+
+        state
+            .create_or_update_adaptive_override(
+                &scope,
+                &rule,
+                &record,
+                &a,
+                "example.com",
+                "unspecified",
+                PreferRollup::Yes,
+                &original,
+            )
+            .unwrap();
+        assert_eq!(
+            state.adaptive_overrides.get(&scope).unwrap().current_limit,
+            80
+        );
+
+        // Not enough time has passed yet: no step.
+        let soon = Utc::now();
+        state.prune_adaptive_overrides(&soon, false).await;
+        assert_eq!(
+            state.adaptive_overrides.get(&scope).unwrap().current_limit,
+            80
+        );
+
+        // Simulate the ramp_up_interval (900s) having elapsed by directly
+        // rewinding last_activity, exactly as a real 15-minute quiet period would.
+        {
+            let mut entry = state.adaptive_overrides.get_mut(&scope).unwrap();
+            entry.last_activity = Utc::now() - chrono::Duration::seconds(1000);
+        }
+        let now = Utc::now();
+        state.prune_adaptive_overrides(&now, false).await;
+        // 80 * 1.10 = 88
+        assert_eq!(
+            state.adaptive_overrides.get(&scope).unwrap().current_limit,
+            88
+        );
+        // last_activity was reset by the step, so a second immediate call does nothing yet.
+        state.prune_adaptive_overrides(&now, false).await;
+        assert_eq!(
+            state.adaptive_overrides.get(&scope).unwrap().current_limit,
+            88
+        );
+    }
+
+    #[tokio::test]
+    async fn test_up_path_removes_entry_on_full_recovery() {
+        let state = TsaState::default();
+        let record = make_record(Utc::now());
+        let rule = simple_rule();
+        let a = adj("connection_limit", 20.0, 25.0, 50.0);
+        let original = toml::Value::Integer(100);
+        let scope =
+            ActionHash::from_rule_and_record(&rule, &Action::AdjustConfig(a.clone()), &record);
+
+        state
+            .create_or_update_adaptive_override(
+                &scope,
+                &rule,
+                &record,
+                &a,
+                "example.com",
+                "unspecified",
+                PreferRollup::Yes,
+                &original,
+            )
+            .unwrap();
+        assert_eq!(
+            state.adaptive_overrides.get(&scope).unwrap().current_limit,
+            80
+        );
+
+        {
+            let mut entry = state.adaptive_overrides.get_mut(&scope).unwrap();
+            entry.last_activity = Utc::now() - chrono::Duration::seconds(1000);
+        }
+        // 80 * 1.5 = 120 >= original (100) -> fully recovered, entry removed.
+        let now = Utc::now();
+        state.prune_adaptive_overrides(&now, false).await;
+        assert!(state.adaptive_overrides.get(&scope).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_up_path_safety_expiry_removes_stuck_entry() {
+        let state = TsaState::default();
+        let record = make_record(Utc::now());
+        let rule = simple_rule(); // duration = 30m
+        let a = adj("connection_limit", 20.0, 25.0, 10.0);
+        let original = toml::Value::Integer(100);
+        let scope =
+            ActionHash::from_rule_and_record(&rule, &Action::AdjustConfig(a.clone()), &record);
+
+        state
+            .create_or_update_adaptive_override(
+                &scope,
+                &rule,
+                &record,
+                &a,
+                "example.com",
+                "unspecified",
+                PreferRollup::Yes,
+                &original,
+            )
+            .unwrap();
+
+        let far_future = Utc::now() + chrono::Duration::hours(1);
+        state.prune_adaptive_overrides(&far_future, false).await;
+        assert!(state.adaptive_overrides.get(&scope).is_none());
     }
 }
