@@ -10,8 +10,10 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::Json;
 use chrono::{DateTime, Utc};
+use kumo_api_types::egress_path::EgressPathConfig;
 use kumo_api_types::shaping::{
-    Action, EgressPathConfigValueUnchecked, Regex, Rule, Shaping, Trigger,
+    site_name_from_record, Action, EgressPathConfigAdjustment, EgressPathConfigValueUnchecked,
+    Regex, Rule, Shaping, Trigger,
 };
 use kumo_api_types::tsa::{
     ReadyQSuspension, SchedQBounce, SchedQSuspension, SubscriptionItem, SuspensionEntry,
@@ -262,6 +264,64 @@ async fn create_ready_q_suspension(
     Ok(())
 }
 
+/// Resolve the current base value for `adj.name` on `domain` from the
+/// daemon's periodically-refreshed shaping config, then apply the
+/// AdjustConfig/AdjustDomainConfig down-path against it.
+///
+/// If the field has no explicit base value anywhere in the shaping
+/// config for this domain, `connection_limit` falls back to
+/// `EgressPathConfig`'s struct-level default (since it always has one);
+/// the rate fields (`max_message_rate`/`max_connection_rate`/
+/// `source_selection_rate`) have no meaningful default (unset means
+/// unlimited), so those are logged and skipped rather than treated as
+/// an error that would abort processing of the rest of this record's
+/// other matched actions.
+async fn apply_adjust_config(
+    action_hash: &ActionHash,
+    rule: &Rule,
+    record: &JsonLogRecord,
+    adj: &EgressPathConfigAdjustment,
+    domain: &str,
+    source: &str,
+    prefer_rollup: PreferRollup,
+    shaping: &Shaping,
+) -> anyhow::Result<()> {
+    let site_name = site_name_from_record(record);
+    let merged = shaping
+        .get_egress_path_config_value(domain, source, &site_name)
+        .await?;
+
+    let original_value = match merged.get(&adj.name) {
+        Some(v) => json_to_toml_value(v)?,
+        None if adj.name == "connection_limit" => {
+            toml::Value::Integer(EgressPathConfig::default().connection_limit.limit as i64)
+        }
+        None => {
+            tracing::error!(
+                "AdjustConfig/AdjustDomainConfig for domain={domain} field={} skipped: \
+                 field is not configured for this domain, so there is no base value \
+                 to adjust relative to",
+                adj.name
+            );
+            return Ok(());
+        }
+    };
+
+    TSA_STATE
+        .get()
+        .expect("tsa_state missing")
+        .create_or_update_adaptive_override(
+            action_hash,
+            rule,
+            record,
+            adj,
+            domain,
+            source,
+            prefer_rollup,
+            &original_value,
+        )
+}
+
 pub async fn publish_log_batch(records: &mut Vec<JsonLogRecord>) -> anyhow::Result<()> {
     let shaping = get_shaping();
 
@@ -409,6 +469,32 @@ async fn publish_log_v1_impl(
                                     source,
                                     PreferRollup::No,
                                 );
+                        }
+                        Action::AdjustConfig(adj) => {
+                            apply_adjust_config(
+                                &action_hash,
+                                m,
+                                &record,
+                                adj,
+                                &domain,
+                                source,
+                                PreferRollup::Yes,
+                                shaping,
+                            )
+                            .await?;
+                        }
+                        Action::AdjustDomainConfig(adj) => {
+                            apply_adjust_config(
+                                &action_hash,
+                                m,
+                                &record,
+                                adj,
+                                &domain,
+                                source,
+                                PreferRollup::No,
+                                shaping,
+                            )
+                            .await?;
                         }
                         Action::Bounce => {
                             create_bounce(
