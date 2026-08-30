@@ -69,6 +69,7 @@ mod tls_opportunistic_reconnect;
 mod tsa_adjust_config_amount_mode;
 mod tsa_adjust_config_automation;
 mod tsa_adjust_config_compound_floor;
+mod tsa_adjust_config_max_deliveries;
 mod tsa_adjust_config_ramp_up;
 mod tsa_adjust_config_rate_field;
 mod tsa_adjust_config_rollup;

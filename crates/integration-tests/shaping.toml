@@ -75,3 +75,8 @@ duration = "1 hour"
 regex = "you said 450-adjust-amount"
 action = {AdjustConfig={name="connection_limit", decrease_amount=10, floor_amount=5, ramp_up_interval="5m"}}
 duration = "1 hour"
+
+[["delivery.mx-sink.wezfurlong.org".automation]]
+regex = "you said 450-adjust-deliveries"
+action = {AdjustConfig={name="max_deliveries_per_connection", decrease_amount=24, floor_amount=500, ramp_up_interval="5m"}}
+duration = "1 hour"

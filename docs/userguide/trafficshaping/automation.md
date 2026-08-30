@@ -190,6 +190,17 @@ Each match reduces `connection_limit` by a flat 5, down to a floor of 2,
 and ramps back up by 5 per step (`ramp_step_amount` defaults to
 `decrease_amount`) once 10 minutes pass with no further matches.
 
+`AdjustConfig`/`AdjustDomainConfig` also supports `max_deliveries_per_connection`,
+useful for ISPs that complain about too many messages sent over a single
+connection:
+
+{% call toml_data() %}
+[["example.com".automation]]
+regex = "450 .*too many messages"
+action = {AdjustConfig={name="max_deliveries_per_connection", decrease_amount=25, floor_amount=100, ramp_up_interval="10m"}}
+duration = "1hr"
+{% endcall %}
+
 ## Monitoring the TSA Daemon
 
 Adjustments to the traffic shaping rules are achieved by creating a custom `shaping.toml` file that is maintained by the TSA daemon and loaded as an overlay on the existing `shaping.toml file created by the user.

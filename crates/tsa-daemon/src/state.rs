@@ -180,6 +180,11 @@ pub enum AdaptiveFieldTemplate {
     Limit {
         force_local: bool,
     },
+    /// A plain integer count with no wrapper type at all (e.g.
+    /// `max_deliveries_per_connection`, a bare `usize` on
+    /// `EgressPathConfig`) -- unlike `Limit`, there is no `force_local`
+    /// concept to round-trip.
+    PlainInteger,
 }
 
 impl AdaptiveFieldTemplate {
@@ -200,6 +205,7 @@ impl AdaptiveFieldTemplate {
             }
             Self::Limit { force_local: true } => toml::Value::String(format!("local:{limit}")),
             Self::Limit { force_local: false } => toml::Value::Integer(limit as i64),
+            Self::PlainInteger => toml::Value::Integer(limit as i64),
         }
     }
 }
@@ -233,6 +239,11 @@ pub fn parse_adaptive_field_value(
                     force_local: spec.force_local,
                 },
             ))
+        }
+        "max_deliveries_per_connection" => {
+            let limit = u64::deserialize(value.clone())
+                .with_context(|| format!("parsing {field_name} value {value:?} as an integer"))?;
+            Ok((limit, AdaptiveFieldTemplate::PlainInteger))
         }
         other => anyhow::bail!(
             "unsupported AdjustConfig field {other:?}; supported fields are: {}",
@@ -1447,6 +1458,16 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_adaptive_field_value_plain_integer() {
+        let (limit, template) =
+            parse_adaptive_field_value("max_deliveries_per_connection", &toml::Value::Integer(500))
+                .unwrap();
+        assert_eq!(limit, 500);
+        assert_eq!(template, AdaptiveFieldTemplate::PlainInteger);
+        assert_eq!(template.to_toml_value(400), toml::Value::Integer(400));
+    }
+
+    #[test]
     fn test_parse_adaptive_field_value_rejects_unsupported_field() {
         let err =
             parse_adaptive_field_value("enable_tls", &toml::Value::Boolean(true)).unwrap_err();
@@ -1598,6 +1619,36 @@ mod tests {
             state.adaptive_overrides.get(&scope).unwrap().current_limit,
             10
         );
+    }
+
+    #[test]
+    fn test_down_path_max_deliveries_per_connection() {
+        let state = TsaState::default();
+        let rule = simple_rule();
+        let a = adj_amount("max_deliveries_per_connection", 100, 50, 100);
+        let scope = ActionHash::from_rule_and_record(
+            &rule,
+            &Action::AdjustConfig(a.clone()),
+            &make_record(Utc::now()),
+        );
+        let original = toml::Value::Integer(1024);
+
+        state
+            .create_or_update_adaptive_override(
+                &scope,
+                &rule,
+                &make_record(Utc::now()),
+                &a,
+                "example.com",
+                "unspecified",
+                PreferRollup::Yes,
+                &original,
+            )
+            .unwrap();
+        let entry = state.adaptive_overrides.get(&scope).unwrap();
+        assert_eq!(entry.current_limit, 924);
+        assert_eq!(entry.template, AdaptiveFieldTemplate::PlainInteger);
+        assert_eq!(entry.template.to_toml_value(924), toml::Value::Integer(924));
     }
 
     #[test]

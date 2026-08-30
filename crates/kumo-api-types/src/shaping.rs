@@ -203,6 +203,7 @@ pub const ADAPTIVE_SUPPORTED_FIELDS: &[&str] = &[
     "max_connection_rate",
     "source_selection_rate",
     "connection_limit",
+    "max_deliveries_per_connection",
 ];
 
 /// A relative adjustment magnitude: either a percentage of the relevant

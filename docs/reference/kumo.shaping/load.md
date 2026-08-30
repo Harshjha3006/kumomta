@@ -239,7 +239,8 @@ The following new actions are now supported:
    is stepped back up, repeating until it reaches its original value, at
    which point the override is removed. Only numeric rate/limit fields are
    supported: `max_message_rate`, `max_connection_rate`,
-   `source_selection_rate`, and `connection_limit`.
+   `source_selection_rate`, `connection_limit`, and
+   `max_deliveries_per_connection`.
 
    The size of the decrease/floor/ramp-up-step is specified using exactly
    one of two styles, not both:

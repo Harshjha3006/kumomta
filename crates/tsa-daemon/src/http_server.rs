@@ -269,13 +269,13 @@ async fn create_ready_q_suspension(
 /// AdjustConfig/AdjustDomainConfig down-path against it.
 ///
 /// If the field has no explicit base value anywhere in the shaping
-/// config for this domain, `connection_limit` falls back to
-/// `EgressPathConfig`'s struct-level default (since it always has one);
-/// the rate fields (`max_message_rate`/`max_connection_rate`/
-/// `source_selection_rate`) have no meaningful default (unset means
-/// unlimited), so those are logged and skipped rather than treated as
-/// an error that would abort processing of the rest of this record's
-/// other matched actions.
+/// config for this domain, `connection_limit` and
+/// `max_deliveries_per_connection` fall back to `EgressPathConfig`'s
+/// struct-level defaults (since they always have one); the rate fields
+/// (`max_message_rate`/`max_connection_rate`/`source_selection_rate`)
+/// have no meaningful default (unset means unlimited), so those are
+/// logged and skipped rather than treated as an error that would abort
+/// processing of the rest of this record's other matched actions.
 async fn apply_adjust_config(
     action_hash: &ActionHash,
     rule: &Rule,
@@ -305,6 +305,9 @@ async fn apply_adjust_config(
         Some(v) => json_to_toml_value(v)?,
         None if adj.name == "connection_limit" => {
             toml::Value::Integer(EgressPathConfig::default().connection_limit.limit as i64)
+        }
+        None if adj.name == "max_deliveries_per_connection" => {
+            toml::Value::Integer(EgressPathConfig::default().max_deliveries_per_connection as i64)
         }
         None => {
             tracing::error!(
