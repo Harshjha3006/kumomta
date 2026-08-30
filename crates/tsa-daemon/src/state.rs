@@ -7,8 +7,8 @@ use anyhow::Context;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use kumo_api_types::shaping::{
-    Action, EgressPathConfigAdjustment, EgressPathConfigValue, EgressPathConfigValueUnchecked,
-    Rule, ADAPTIVE_SUPPORTED_FIELDS,
+    Action, AdjustmentMagnitude, EgressPathConfigAdjustment, EgressPathConfigValue,
+    EgressPathConfigValueUnchecked, Rule, ADAPTIVE_SUPPORTED_FIELDS,
 };
 use kumo_api_types::tsa::{ReadyQSuspension, SchedQBounce, SchedQSuspension};
 use kumo_log_types::JsonLogRecord;
@@ -241,6 +241,48 @@ pub fn parse_adaptive_field_value(
     }
 }
 
+/// Resolve a floor magnitude against the field's original value: a
+/// percentage of `original_limit`, or a fixed absolute count. Either way,
+/// never below 1.
+fn magnitude_floor(floor: AdjustmentMagnitude, original_limit: u64) -> u64 {
+    match floor {
+        AdjustmentMagnitude::Percent(p) => {
+            ((original_limit as f64) * (p / 100.0)).round().max(1.0) as u64
+        }
+        AdjustmentMagnitude::Amount(a) => a.max(1),
+    }
+}
+
+/// Apply a decrease magnitude to the current value: a percentage of the
+/// current value, or a fixed absolute count subtracted from it. Either
+/// way, never below 1.
+fn magnitude_decrease(decrease: AdjustmentMagnitude, current_limit: u64) -> u64 {
+    match decrease {
+        AdjustmentMagnitude::Percent(p) => ((current_limit as f64) * (1.0 - p / 100.0))
+            .round()
+            .max(1.0) as u64,
+        AdjustmentMagnitude::Amount(a) => current_limit.saturating_sub(a).max(1),
+    }
+}
+
+/// Apply a ramp-up step magnitude to the current value: a percentage of
+/// the current value, or a fixed absolute count added to it. The percent
+/// case guarantees monotonic progress even when naive rounding would
+/// otherwise stall on small integer limits (see the regression test for
+/// this); the amount case always progresses by at least
+/// `ramp_step_amount` (validated > 0), so no equivalent guard is needed.
+fn magnitude_increase(ramp_step: AdjustmentMagnitude, current_limit: u64) -> u64 {
+    match ramp_step {
+        AdjustmentMagnitude::Percent(p) => {
+            let raw = ((current_limit as f64) * (1.0 + p / 100.0))
+                .round()
+                .max(1.0) as u64;
+            raw.max(current_limit + 1)
+        }
+        AdjustmentMagnitude::Amount(a) => current_limit.saturating_add(a),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdaptiveOverride {
     pub domain: String,
@@ -251,9 +293,9 @@ pub struct AdaptiveOverride {
     pub template: AdaptiveFieldTemplate,
     pub original_limit: u64,
     pub current_limit: u64,
-    pub decrease_percent: f64,
-    pub floor_percent: f64,
-    pub ramp_step_percent: f64,
+    pub decrease: AdjustmentMagnitude,
+    pub floor: AdjustmentMagnitude,
+    pub ramp_step: AdjustmentMagnitude,
     pub ramp_up_interval_secs: i64,
     pub safety_duration_secs: i64,
     pub last_activity: DateTime<Utc>,
@@ -376,8 +418,8 @@ impl TsaState {
     /// Apply the down-path of an AdjustConfig/AdjustDomainConfig action:
     /// create the override entry on first trigger (seeding it from
     /// `original_value`), or compound the existing entry's current value
-    /// down by `decrease_percent`, clamped at `floor_percent` of the
-    /// original value.
+    /// down by `decrease` (a percentage or absolute count), clamped at
+    /// `floor` of the original value.
     pub fn create_or_update_adaptive_override(
         &self,
         scope: &ActionHash,
@@ -424,9 +466,9 @@ impl TsaState {
                     template,
                     original_limit,
                     current_limit: original_limit,
-                    decrease_percent: adj.decrease_percent,
-                    floor_percent: adj.floor_percent,
-                    ramp_step_percent: adj.ramp_step_percent,
+                    decrease: adj.decrease,
+                    floor: adj.floor,
+                    ramp_step: adj.ramp_step,
                     ramp_up_interval_secs: adj.ramp_up_interval.as_secs() as i64,
                     safety_duration_secs: rule.duration.as_secs() as i64,
                     last_activity: now,
@@ -441,12 +483,8 @@ impl TsaState {
             return Ok(());
         };
 
-        let floor_limit = ((entry.original_limit as f64) * (entry.floor_percent / 100.0))
-            .round()
-            .max(1.0) as u64;
-        let decreased = ((entry.current_limit as f64) * (1.0 - entry.decrease_percent / 100.0))
-            .round()
-            .max(1.0) as u64;
+        let floor_limit = magnitude_floor(entry.floor, entry.original_limit);
+        let decreased = magnitude_decrease(entry.decrease, entry.current_limit);
         entry.current_limit = decreased.max(floor_limit);
         entry.last_activity = now;
         entry.expires = expires;
@@ -956,17 +994,7 @@ impl TsaState {
             if now_ts - last_activity_ts < over.ramp_up_interval_secs {
                 return false;
             }
-            let increased = ((over.current_limit as f64) * (1.0 + over.ramp_step_percent / 100.0))
-                .round()
-                .max(1.0) as u64;
-            // Guarantee monotonic upward progress: on small integer limits
-            // (e.g. current_limit=3, ramp_step_percent=10 -> 3*1.10=3.3
-            // rounds back down to 3), naive rounding can otherwise leave
-            // the value unchanged forever, stalling the ramp-up and
-            // leaking this entry (it never reaches original_limit, but
-            // the tick still refreshes `expires` every time via the step
-            // branch, so the safety-net expiry never fires either).
-            let increased = increased.max(over.current_limit + 1);
+            let increased = magnitude_increase(over.ramp_step, over.current_limit);
             increased >= over.original_limit
         };
 
@@ -1002,15 +1030,9 @@ impl TsaState {
                 if now_ts - last_activity_ts < entry.ramp_up_interval_secs {
                     continue;
                 }
-                let increased = ((entry.current_limit as f64)
-                    * (1.0 + entry.ramp_step_percent / 100.0))
-                    .round()
-                    .max(1.0) as u64;
-                // Keep in lockstep with the identical guard in the
-                // `is_removable` closure above: guarantee monotonic
-                // upward progress even when naive rounding would
-                // otherwise stall on small integer limits.
-                let increased = increased.max(entry.current_limit + 1);
+                // Keep in lockstep with the identical computation in the
+                // `is_removable` closure above.
+                let increased = magnitude_increase(entry.ramp_step, entry.current_limit);
                 if increased >= entry.original_limit {
                     // Extremely narrow window: became eligible for full
                     // recovery between the remove_if check above and this
@@ -1300,10 +1322,28 @@ mod tests {
     ) -> EgressPathConfigAdjustment {
         EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
             name: name.to_string(),
-            decrease_percent,
-            floor_percent,
+            decrease_percent: Some(decrease_percent),
+            floor_percent: Some(floor_percent),
             ramp_step_percent: Some(ramp_step_percent),
             ramp_up_interval: std::time::Duration::from_secs(900),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn adj_amount(
+        name: &str,
+        decrease_amount: u64,
+        floor_amount: u64,
+        ramp_step_amount: u64,
+    ) -> EgressPathConfigAdjustment {
+        EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
+            name: name.to_string(),
+            decrease_amount: Some(decrease_amount),
+            floor_amount: Some(floor_amount),
+            ramp_step_amount: Some(ramp_step_amount),
+            ramp_up_interval: std::time::Duration::from_secs(900),
+            ..Default::default()
         })
         .unwrap()
     }
@@ -1502,6 +1542,61 @@ mod tests {
         assert_eq!(
             state.adaptive_overrides.get(&scope).unwrap().current_limit,
             250
+        );
+    }
+
+    #[test]
+    fn test_down_path_amount_mode_compounds_and_clamps_to_floor() {
+        let state = TsaState::default();
+        let rule = simple_rule();
+        let a = adj_amount("connection_limit", 15, 10, 15);
+        let scope = ActionHash::from_rule_and_record(
+            &rule,
+            &Action::AdjustConfig(a.clone()),
+            &make_record(Utc::now()),
+        );
+        let original = toml::Value::Integer(50);
+
+        // 50 -> 35 -> 20 -> 5 (clamped up to floor_amount=10)
+        for expected in [35, 20, 10] {
+            let record = make_record(Utc::now());
+            state
+                .create_or_update_adaptive_override(
+                    &scope,
+                    &rule,
+                    &record,
+                    &a,
+                    "example.com",
+                    "unspecified",
+                    PreferRollup::Yes,
+                    &original,
+                )
+                .unwrap();
+            assert_eq!(
+                state.adaptive_overrides.get(&scope).unwrap().current_limit,
+                expected
+            );
+        }
+
+        // Already at the floor: further triggers must not go any lower.
+        for _ in 0..5 {
+            let record = make_record(Utc::now());
+            state
+                .create_or_update_adaptive_override(
+                    &scope,
+                    &rule,
+                    &record,
+                    &a,
+                    "example.com",
+                    "unspecified",
+                    PreferRollup::Yes,
+                    &original,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            state.adaptive_overrides.get(&scope).unwrap().current_limit,
+            10
         );
     }
 
@@ -1777,6 +1872,56 @@ mod tests {
         // 80 * 1.5 = 120 >= original (100) -> fully recovered, entry removed.
         let now = Utc::now();
         state.prune_adaptive_overrides(&now, false).await;
+        assert!(state.adaptive_overrides.get(&scope).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_up_path_amount_mode_steps_and_recovers() {
+        let state = TsaState::default();
+        let record = make_record(Utc::now());
+        let rule = simple_rule();
+        let a = adj_amount("connection_limit", 30, 0, 25);
+        let original = toml::Value::Integer(100);
+        let scope =
+            ActionHash::from_rule_and_record(&rule, &Action::AdjustConfig(a.clone()), &record);
+
+        state
+            .create_or_update_adaptive_override(
+                &scope,
+                &rule,
+                &record,
+                &a,
+                "example.com",
+                "unspecified",
+                PreferRollup::Yes,
+                &original,
+            )
+            .unwrap();
+        // 100 - 30 = 70
+        assert_eq!(
+            state.adaptive_overrides.get(&scope).unwrap().current_limit,
+            70
+        );
+
+        {
+            let mut entry = state.adaptive_overrides.get_mut(&scope).unwrap();
+            entry.last_activity = Utc::now() - chrono::Duration::seconds(1000);
+        }
+        let now = Utc::now();
+        state.prune_adaptive_overrides(&now, false).await;
+        // 70 + 25 = 95, not yet >= original (100)
+        assert_eq!(
+            state.adaptive_overrides.get(&scope).unwrap().current_limit,
+            95
+        );
+
+        {
+            let mut entry = state.adaptive_overrides.get_mut(&scope).unwrap();
+            entry.last_activity = Utc::now() - chrono::Duration::seconds(1000);
+        }
+        let now = Utc::now();
+        state.prune_adaptive_overrides(&now, false).await;
+        // 95 + 25 = 120 >= original (100) -> fully recovered, entry removed.
         assert!(state.adaptive_overrides.get(&scope).is_none());
     }
 

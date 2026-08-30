@@ -172,6 +172,24 @@ which annotates each adjusted field with its original value, how far
 below original it currently is, and when the next ramp-up step is
 eligible.
 
+If a percentage doesn't fit your mental model well for a given field --
+for example, you'd rather think in terms of "cut the connection limit by
+5" than "cut it by some percent" -- use the absolute-count fields instead:
+`decrease_amount`/`floor_amount`/`ramp_step_amount` in place of
+`decrease_percent`/`floor_percent`/`ramp_step_percent`. A rule uses one
+style or the other, never both:
+
+{% call toml_data() %}
+[["example.com".automation]]
+regex = "421 .*too many connections"
+action = {AdjustConfig={name="connection_limit", decrease_amount=5, floor_amount=2, ramp_up_interval="10m"}}
+duration = "1hr"
+{% endcall %}
+
+Each match reduces `connection_limit` by a flat 5, down to a floor of 2,
+and ramps back up by 5 per step (`ramp_step_amount` defaults to
+`decrease_amount`) once 10 minutes pass with no further matches.
+
 ## Monitoring the TSA Daemon
 
 Adjustments to the traffic shaping rules are achieved by creating a custom `shaping.toml` file that is maintained by the TSA daemon and loaded as an overlay on the existing `shaping.toml file created by the user.

@@ -70,3 +70,8 @@ duration = "1 hour"
 regex = "you said 450-adjust-default-norollup"
 action = {AdjustDomainConfig={name="connection_limit", decrease_percent=25, floor_percent=10, ramp_up_interval="5m"}}
 duration = "1 hour"
+
+[["delivery.mx-sink.wezfurlong.org".automation]]
+regex = "you said 450-adjust-amount"
+action = {AdjustConfig={name="connection_limit", decrease_amount=10, floor_amount=5, ramp_up_interval="5m"}}
+duration = "1 hour"

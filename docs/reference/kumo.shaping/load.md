@@ -232,18 +232,32 @@ The following new actions are now supported:
 
 The following new actions are now supported:
 
- * `{AdjustConfig{name="NAME", decrease_percent=N, floor_percent=N, ramp_step_percent=N, ramp_up_interval="DURATION"}}` -
+ * `{AdjustConfig{name="NAME", ..., ramp_up_interval="DURATION"}}` -
    define a *relative* configuration adjustment: each time the rule triggers,
-   `NAME` is decreased by `decrease_percent` percent of its current value
-   (compounding on repeated triggers), never going below `floor_percent`
-   percent of its original configured value. Once the rule stops triggering
-   for `ramp_up_interval`, the value is stepped back up by
-   `ramp_step_percent` percent, repeating until it reaches its original
-   value, at which point the override is removed. `ramp_step_percent`
-   defaults to `decrease_percent` if omitted. Only numeric rate/limit
-   fields are supported: `max_message_rate`, `max_connection_rate`,
+   `NAME` is decreased (compounding on repeated triggers), never going below
+   a floor. Once the rule stops triggering for `ramp_up_interval`, the value
+   is stepped back up, repeating until it reaches its original value, at
+   which point the override is removed. Only numeric rate/limit fields are
+   supported: `max_message_rate`, `max_connection_rate`,
    `source_selection_rate`, and `connection_limit`.
- * `{AdjustDomainConfig{name="NAME", decrease_percent=N, floor_percent=N, ramp_step_percent=N, ramp_up_interval="DURATION"}}` -
+
+   The size of the decrease/floor/ramp-up-step is specified using exactly
+   one of two styles, not both:
+    * **Percentage** - `decrease_percent=N, floor_percent=N,
+      ramp_step_percent=N`. `NAME` is decreased by `decrease_percent`
+      percent of its current value, never below `floor_percent` percent of
+      its original value, and ramped up by `ramp_step_percent` percent per
+      step. `ramp_step_percent` defaults to `decrease_percent` if omitted.
+    * **Absolute count** - `decrease_amount=N, floor_amount=N,
+      ramp_step_amount=N`. `NAME` is decreased by a fixed count each
+      trigger, never below `floor_amount` (defaults to `0`, i.e. no floor
+      beyond the field's own minimum), and ramped up by a fixed count per
+      step. `ramp_step_amount` defaults to `decrease_amount` if omitted.
+      {{since('dev', inline=True)}}
+
+   Mixing the two styles within one rule (e.g. `decrease_amount` together
+   with `floor_percent`) is rejected at config-load time.
+ * `{AdjustDomainConfig{name="NAME", ...}}` -
    same as `AdjustConfig`, but with `mx_rollup=false`, even if the rule was
    defined inside a domain where `mx_rollup=true`.
 
@@ -256,4 +270,14 @@ rate, ramping back up by 10% every 15 minutes of quiet:
 regex = "\\[TS02\\]"
 action = {AdjustConfig={name="max_message_rate", decrease_percent=10, floor_percent=25, ramp_up_interval="15m"}}
 duration = "30m"
+{% endcall %}
+
+Or, to reduce `connection_limit` by a fixed count of 5 (down to a floor of
+2), ramping back up by 1 every 10 minutes of quiet:
+
+{% call toml_data() %}
+[["example.com".automation]]
+regex = "421 .*too many connections"
+action = {AdjustConfig={name="connection_limit", decrease_amount=5, floor_amount=2, ramp_step_amount=1, ramp_up_interval="10m"}}
+duration = "1hr"
 {% endcall %}

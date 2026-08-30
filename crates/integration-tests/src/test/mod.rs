@@ -66,6 +66,7 @@ mod tls_client_certificate;
 mod tls_info_log;
 mod tls_opportunistic_fail;
 mod tls_opportunistic_reconnect;
+mod tsa_adjust_config_amount_mode;
 mod tsa_adjust_config_automation;
 mod tsa_adjust_config_compound_floor;
 mod tsa_adjust_config_ramp_up;

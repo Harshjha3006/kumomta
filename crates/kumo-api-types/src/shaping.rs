@@ -196,8 +196,8 @@ impl From<EgressPathConfigValue> for EgressPathConfigValueUnchecked {
 }
 
 /// Field names that AdjustConfig/AdjustDomainConfig may target. Limited to
-/// numeric rate/limit fields for which a percentage-based relative
-/// adjustment is meaningful.
+/// numeric rate/limit fields for which a relative adjustment is
+/// meaningful.
 pub const ADAPTIVE_SUPPORTED_FIELDS: &[&str] = &[
     "max_message_rate",
     "max_connection_rate",
@@ -205,11 +205,38 @@ pub const ADAPTIVE_SUPPORTED_FIELDS: &[&str] = &[
     "connection_limit",
 ];
 
+/// A relative adjustment magnitude: either a percentage of the relevant
+/// base value, or a fixed absolute count. A single AdjustConfig rule uses
+/// exactly one style for all of decrease/floor/ramp_step -- see
+/// `EgressPathConfigAdjustmentUnchecked`'s `TryFrom` validation.
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq)]
+pub enum AdjustmentMagnitude {
+    Percent(f64),
+    Amount(u64),
+}
+
+impl Hash for AdjustmentMagnitude {
+    fn hash<H: Hasher>(&self, h: &mut H) {
+        match self {
+            Self::Percent(p) => {
+                0u8.hash(h);
+                p.to_ne_bytes().hash(h);
+            }
+            Self::Amount(a) => {
+                1u8.hash(h);
+                a.hash(h);
+            }
+        }
+    }
+}
+
 /// Represents a relative/gradual adjustment to a single numeric
-/// EgressPathConfig field: decrease it by a percentage each time the
+/// EgressPathConfig field: decrease it by `decrease` each time the
 /// enclosing rule triggers, and once triggering stops for
-/// `ramp_up_interval`, step it back up by `ramp_step_percent` until it
-/// reaches its original value.
+/// `ramp_up_interval`, step it back up by `ramp_step` until it reaches its
+/// original value. `decrease`/`floor`/`ramp_step` are always the same
+/// `AdjustmentMagnitude` variant for a given rule -- see
+/// `EgressPathConfigAdjustmentUnchecked`'s `TryFrom` validation.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(
     try_from = "EgressPathConfigAdjustmentUnchecked",
@@ -217,30 +244,37 @@ pub const ADAPTIVE_SUPPORTED_FIELDS: &[&str] = &[
 )]
 pub struct EgressPathConfigAdjustment {
     pub name: String,
-    pub decrease_percent: f64,
-    pub floor_percent: f64,
-    pub ramp_step_percent: f64,
+    pub decrease: AdjustmentMagnitude,
+    pub floor: AdjustmentMagnitude,
+    pub ramp_step: AdjustmentMagnitude,
     pub ramp_up_interval: Duration,
 }
 
 impl Hash for EgressPathConfigAdjustment {
     fn hash<H: Hasher>(&self, h: &mut H) {
         self.name.hash(h);
-        self.decrease_percent.to_ne_bytes().hash(h);
-        self.floor_percent.to_ne_bytes().hash(h);
-        self.ramp_step_percent.to_ne_bytes().hash(h);
+        self.decrease.hash(h);
+        self.floor.hash(h);
+        self.ramp_step.hash(h);
         self.ramp_up_interval.hash(h);
     }
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, Default)]
 pub struct EgressPathConfigAdjustmentUnchecked {
     pub name: String,
-    pub decrease_percent: f64,
     #[serde(default)]
-    pub floor_percent: f64,
+    pub decrease_percent: Option<f64>,
+    #[serde(default)]
+    pub decrease_amount: Option<u64>,
+    #[serde(default)]
+    pub floor_percent: Option<f64>,
+    #[serde(default)]
+    pub floor_amount: Option<u64>,
     #[serde(default)]
     pub ramp_step_percent: Option<f64>,
+    #[serde(default)]
+    pub ramp_step_amount: Option<u64>,
     #[serde(with = "duration_serde")]
     pub ramp_up_interval: Duration,
 }
@@ -257,30 +291,75 @@ impl TryFrom<EgressPathConfigAdjustmentUnchecked> for EgressPathConfigAdjustment
                 ADAPTIVE_SUPPORTED_FIELDS.join(", ")
             );
         }
-        if u.decrease_percent.is_nan() || u.decrease_percent <= 0.0 || u.decrease_percent > 100.0 {
-            anyhow::bail!(
-                "decrease_percent must be > 0 and <= 100, got {}",
-                u.decrease_percent
-            );
-        }
-        if u.floor_percent.is_nan() || u.floor_percent < 0.0 || u.floor_percent >= 100.0 {
-            anyhow::bail!(
-                "floor_percent must be >= 0 and < 100, got {}",
-                u.floor_percent
-            );
-        }
-        let ramp_step_percent = u.ramp_step_percent.unwrap_or(u.decrease_percent);
-        if ramp_step_percent.is_nan() || ramp_step_percent <= 0.0 {
-            anyhow::bail!("ramp_step_percent must be > 0, got {ramp_step_percent}");
-        }
+
+        let (decrease, floor, ramp_step) = match (u.decrease_percent, u.decrease_amount) {
+            (Some(_), Some(_)) => {
+                anyhow::bail!(
+                    "specify exactly one of decrease_percent or decrease_amount, not both"
+                );
+            }
+            (None, None) => {
+                anyhow::bail!("must specify one of decrease_percent or decrease_amount");
+            }
+            (Some(decrease_percent), None) => {
+                if u.floor_amount.is_some() || u.ramp_step_amount.is_some() {
+                    anyhow::bail!(
+                        "decrease_percent cannot be combined with floor_amount/ramp_step_amount; \
+                         use floor_percent/ramp_step_percent instead"
+                    );
+                }
+                if decrease_percent.is_nan() || decrease_percent <= 0.0 || decrease_percent > 100.0
+                {
+                    anyhow::bail!(
+                        "decrease_percent must be > 0 and <= 100, got {decrease_percent}"
+                    );
+                }
+                let floor_percent = u.floor_percent.unwrap_or(0.0);
+                if floor_percent.is_nan() || floor_percent < 0.0 || floor_percent >= 100.0 {
+                    anyhow::bail!("floor_percent must be >= 0 and < 100, got {floor_percent}");
+                }
+                let ramp_step_percent = u.ramp_step_percent.unwrap_or(decrease_percent);
+                if ramp_step_percent.is_nan() || ramp_step_percent <= 0.0 {
+                    anyhow::bail!("ramp_step_percent must be > 0, got {ramp_step_percent}");
+                }
+                (
+                    AdjustmentMagnitude::Percent(decrease_percent),
+                    AdjustmentMagnitude::Percent(floor_percent),
+                    AdjustmentMagnitude::Percent(ramp_step_percent),
+                )
+            }
+            (None, Some(decrease_amount)) => {
+                if u.floor_percent.is_some() || u.ramp_step_percent.is_some() {
+                    anyhow::bail!(
+                        "decrease_amount cannot be combined with floor_percent/ramp_step_percent; \
+                         use floor_amount/ramp_step_amount instead"
+                    );
+                }
+                if decrease_amount == 0 {
+                    anyhow::bail!("decrease_amount must be greater than zero");
+                }
+                let floor_amount = u.floor_amount.unwrap_or(0);
+                let ramp_step_amount = u.ramp_step_amount.unwrap_or(decrease_amount);
+                if ramp_step_amount == 0 {
+                    anyhow::bail!("ramp_step_amount must be greater than zero");
+                }
+                (
+                    AdjustmentMagnitude::Amount(decrease_amount),
+                    AdjustmentMagnitude::Amount(floor_amount),
+                    AdjustmentMagnitude::Amount(ramp_step_amount),
+                )
+            }
+        };
+
         if u.ramp_up_interval.is_zero() {
             anyhow::bail!("ramp_up_interval must be greater than zero");
         }
+
         Ok(Self {
             name: u.name,
-            decrease_percent: u.decrease_percent,
-            floor_percent: u.floor_percent,
-            ramp_step_percent,
+            decrease,
+            floor,
+            ramp_step,
             ramp_up_interval: u.ramp_up_interval,
         })
     }
@@ -288,11 +367,23 @@ impl TryFrom<EgressPathConfigAdjustmentUnchecked> for EgressPathConfigAdjustment
 
 impl From<EgressPathConfigAdjustment> for EgressPathConfigAdjustmentUnchecked {
     fn from(c: EgressPathConfigAdjustment) -> Self {
+        fn split(m: AdjustmentMagnitude) -> (Option<f64>, Option<u64>) {
+            match m {
+                AdjustmentMagnitude::Percent(p) => (Some(p), None),
+                AdjustmentMagnitude::Amount(a) => (None, Some(a)),
+            }
+        }
+        let (decrease_percent, decrease_amount) = split(c.decrease);
+        let (floor_percent, floor_amount) = split(c.floor);
+        let (ramp_step_percent, ramp_step_amount) = split(c.ramp_step);
         Self {
             name: c.name,
-            decrease_percent: c.decrease_percent,
-            floor_percent: c.floor_percent,
-            ramp_step_percent: Some(c.ramp_step_percent),
+            decrease_percent,
+            decrease_amount,
+            floor_percent,
+            floor_amount,
+            ramp_step_percent,
+            ramp_step_amount,
             ramp_up_interval: c.ramp_up_interval,
         }
     }
@@ -2635,10 +2726,10 @@ MergedEntry {
     fn test_adjust_config_rejects_unsupported_field() {
         let err = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
             name: "enable_tls".to_string(),
-            decrease_percent: 10.0,
-            floor_percent: 25.0,
-            ramp_step_percent: None,
+            decrease_percent: Some(10.0),
+            floor_percent: Some(25.0),
             ramp_up_interval: std::time::Duration::from_secs(900),
+            ..Default::default()
         })
         .unwrap_err();
         assert!(err.to_string().contains("not supported"), "{err}");
@@ -2649,29 +2740,29 @@ MergedEntry {
         let bad_decrease =
             EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
                 name: "max_message_rate".to_string(),
-                decrease_percent: 0.0,
-                floor_percent: 25.0,
-                ramp_step_percent: None,
+                decrease_percent: Some(0.0),
+                floor_percent: Some(25.0),
                 ramp_up_interval: std::time::Duration::from_secs(900),
+                ..Default::default()
             });
         assert!(bad_decrease.is_err());
 
         let bad_floor = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
             name: "max_message_rate".to_string(),
-            decrease_percent: 10.0,
-            floor_percent: 100.0,
-            ramp_step_percent: None,
+            decrease_percent: Some(10.0),
+            floor_percent: Some(100.0),
             ramp_up_interval: std::time::Duration::from_secs(900),
+            ..Default::default()
         });
         assert!(bad_floor.is_err());
 
         let zero_interval =
             EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
                 name: "max_message_rate".to_string(),
-                decrease_percent: 10.0,
-                floor_percent: 25.0,
-                ramp_step_percent: None,
+                decrease_percent: Some(10.0),
+                floor_percent: Some(25.0),
                 ramp_up_interval: std::time::Duration::from_secs(0),
+                ..Default::default()
             });
         assert!(zero_interval.is_err());
     }
@@ -2680,10 +2771,10 @@ MergedEntry {
     fn test_adjust_config_rejects_negative_floor_percent() {
         let err = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
             name: "max_message_rate".to_string(),
-            decrease_percent: 10.0,
-            floor_percent: -1.0,
-            ramp_step_percent: None,
+            decrease_percent: Some(10.0),
+            floor_percent: Some(-1.0),
             ramp_up_interval: std::time::Duration::from_secs(900),
+            ..Default::default()
         })
         .unwrap_err();
         assert!(err.to_string().contains("floor_percent"), "{err}");
@@ -2693,10 +2784,10 @@ MergedEntry {
     fn test_adjust_config_rejects_decrease_percent_above_100() {
         let err = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
             name: "max_message_rate".to_string(),
-            decrease_percent: 100.1,
-            floor_percent: 25.0,
-            ramp_step_percent: None,
+            decrease_percent: Some(100.1),
+            floor_percent: Some(25.0),
             ramp_up_interval: std::time::Duration::from_secs(900),
+            ..Default::default()
         })
         .unwrap_err();
         assert!(err.to_string().contains("decrease_percent"), "{err}");
@@ -2706,19 +2797,21 @@ MergedEntry {
     fn test_adjust_config_rejects_explicit_invalid_ramp_step_percent() {
         let zero = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
             name: "max_message_rate".to_string(),
-            decrease_percent: 10.0,
-            floor_percent: 25.0,
+            decrease_percent: Some(10.0),
+            floor_percent: Some(25.0),
             ramp_step_percent: Some(0.0),
             ramp_up_interval: std::time::Duration::from_secs(900),
+            ..Default::default()
         });
         assert!(zero.is_err());
 
         let negative = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
             name: "max_message_rate".to_string(),
-            decrease_percent: 10.0,
-            floor_percent: 25.0,
+            decrease_percent: Some(10.0),
+            floor_percent: Some(25.0),
             ramp_step_percent: Some(-5.0),
             ramp_up_interval: std::time::Duration::from_secs(900),
+            ..Default::default()
         });
         assert!(negative.is_err());
     }
@@ -2729,14 +2822,15 @@ MergedEntry {
         // floor_percent == 0.0 (lower inclusive bound) are both valid.
         let adj = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
             name: "max_message_rate".to_string(),
-            decrease_percent: 100.0,
-            floor_percent: 0.0,
+            decrease_percent: Some(100.0),
+            floor_percent: Some(0.0),
             ramp_step_percent: Some(1.0),
             ramp_up_interval: std::time::Duration::from_secs(900),
+            ..Default::default()
         })
         .unwrap();
-        assert_eq!(adj.decrease_percent, 100.0);
-        assert_eq!(adj.floor_percent, 0.0);
+        assert_eq!(adj.decrease, AdjustmentMagnitude::Percent(100.0));
+        assert_eq!(adj.floor, AdjustmentMagnitude::Percent(0.0));
     }
 
     #[test]
@@ -2744,10 +2838,10 @@ MergedEntry {
         for name in ADAPTIVE_SUPPORTED_FIELDS {
             EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
                 name: name.to_string(),
-                decrease_percent: 10.0,
-                floor_percent: 25.0,
-                ramp_step_percent: None,
+                decrease_percent: Some(10.0),
+                floor_percent: Some(25.0),
                 ramp_up_interval: std::time::Duration::from_secs(900),
+                ..Default::default()
             })
             .unwrap_or_else(|err| panic!("field {name:?} should be accepted: {err}"));
         }
@@ -2757,13 +2851,13 @@ MergedEntry {
     fn test_adjust_config_ramp_step_percent_defaults_to_decrease_percent() {
         let adj = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
             name: "connection_limit".to_string(),
-            decrease_percent: 12.5,
-            floor_percent: 25.0,
-            ramp_step_percent: None,
+            decrease_percent: Some(12.5),
+            floor_percent: Some(25.0),
             ramp_up_interval: std::time::Duration::from_secs(900),
+            ..Default::default()
         })
         .unwrap();
-        assert_eq!(adj.ramp_step_percent, 12.5);
+        assert_eq!(adj.ramp_step, AdjustmentMagnitude::Percent(12.5));
     }
 
     #[test]
@@ -2781,9 +2875,127 @@ MergedEntry {
         match w.action {
             Action::AdjustConfig(adj) => {
                 assert_eq!(adj.name, "max_message_rate");
-                assert_eq!(adj.decrease_percent, 10.0);
-                assert_eq!(adj.ramp_step_percent, 10.0);
+                assert_eq!(adj.decrease, AdjustmentMagnitude::Percent(10.0));
+                assert_eq!(adj.ramp_step, AdjustmentMagnitude::Percent(10.0));
                 assert_eq!(adj.ramp_up_interval, std::time::Duration::from_secs(900));
+            }
+            other => panic!("expected AdjustConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_adjust_config_rejects_missing_decrease() {
+        let err = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
+            name: "max_message_rate".to_string(),
+            ramp_up_interval: std::time::Duration::from_secs(900),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("decrease_percent or decrease_amount"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_adjust_config_rejects_both_decrease_percent_and_amount() {
+        let err = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
+            name: "max_message_rate".to_string(),
+            decrease_percent: Some(10.0),
+            decrease_amount: Some(5),
+            ramp_up_interval: std::time::Duration::from_secs(900),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("not both"), "{err}");
+    }
+
+    #[test]
+    fn test_adjust_config_rejects_mixed_percent_and_amount_fields() {
+        // decrease_percent with floor_amount: not allowed.
+        let err = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
+            name: "max_message_rate".to_string(),
+            decrease_percent: Some(10.0),
+            floor_amount: Some(5),
+            ramp_up_interval: std::time::Duration::from_secs(900),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("cannot be combined"), "{err}");
+
+        // decrease_amount with ramp_step_percent: not allowed.
+        let err = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
+            name: "connection_limit".to_string(),
+            decrease_amount: Some(5),
+            ramp_step_percent: Some(10.0),
+            ramp_up_interval: std::time::Duration::from_secs(900),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("cannot be combined"), "{err}");
+    }
+
+    #[test]
+    fn test_adjust_config_rejects_zero_decrease_amount() {
+        let err = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
+            name: "connection_limit".to_string(),
+            decrease_amount: Some(0),
+            ramp_up_interval: std::time::Duration::from_secs(900),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("decrease_amount"), "{err}");
+    }
+
+    #[test]
+    fn test_adjust_config_amount_mode_defaults_ramp_step_and_floor() {
+        let adj = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
+            name: "connection_limit".to_string(),
+            decrease_amount: Some(5),
+            ramp_up_interval: std::time::Duration::from_secs(900),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(adj.decrease, AdjustmentMagnitude::Amount(5));
+        assert_eq!(adj.floor, AdjustmentMagnitude::Amount(0));
+        assert_eq!(adj.ramp_step, AdjustmentMagnitude::Amount(5));
+    }
+
+    #[test]
+    fn test_adjust_config_amount_mode_accepts_explicit_floor_and_ramp_step() {
+        let adj = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
+            name: "connection_limit".to_string(),
+            decrease_amount: Some(5),
+            floor_amount: Some(2),
+            ramp_step_amount: Some(1),
+            ramp_up_interval: std::time::Duration::from_secs(900),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(adj.decrease, AdjustmentMagnitude::Amount(5));
+        assert_eq!(adj.floor, AdjustmentMagnitude::Amount(2));
+        assert_eq!(adj.ramp_step, AdjustmentMagnitude::Amount(1));
+    }
+
+    #[test]
+    fn test_adjust_config_deserializes_amount_mode_from_toml_action() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            action: Action,
+        }
+        let w: Wrapper = toml::from_str(
+            r#"
+        action = {AdjustConfig = {name = "connection_limit", decrease_amount = 5, floor_amount = 2, ramp_up_interval = "15m"}}
+        "#,
+        )
+        .unwrap();
+        match w.action {
+            Action::AdjustConfig(adj) => {
+                assert_eq!(adj.name, "connection_limit");
+                assert_eq!(adj.decrease, AdjustmentMagnitude::Amount(5));
+                assert_eq!(adj.floor, AdjustmentMagnitude::Amount(2));
+                assert_eq!(adj.ramp_step, AdjustmentMagnitude::Amount(5));
             }
             other => panic!("expected AdjustConfig, got {other:?}"),
         }

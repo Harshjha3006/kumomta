@@ -1004,10 +1004,11 @@ mod tests {
     fn adj(name: &str) -> EgressPathConfigAdjustment {
         EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
             name: name.to_string(),
-            decrease_percent: 10.0,
-            floor_percent: 25.0,
+            decrease_percent: Some(10.0),
+            floor_percent: Some(25.0),
             ramp_step_percent: Some(10.0),
             ramp_up_interval: std::time::Duration::from_secs(900),
+            ..Default::default()
         })
         .unwrap()
     }
