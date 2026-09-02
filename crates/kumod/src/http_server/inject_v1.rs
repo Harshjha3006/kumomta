@@ -1628,6 +1628,98 @@ Some(
     }
 
     #[tokio::test]
+    async fn test_generate_builder_header_soft_wrap_toggle() {
+        // kumo_wrap::set_soft_wrap_enabled is process-wide global state,
+        // shared with every other test in this binary (the whole kumod
+        // crate, not just this module), since cargo runs them
+        // concurrently in one process. No other test anywhere in the
+        // crate builds unstructured headers with whitespace-separated
+        // content over SOFT_WIDTH (75 cols), so toggling here doesn't
+        // perturb them; this guard restores the default afterwards so
+        // no state leaks to tests added later.
+        struct SoftWrapGuard;
+        impl Drop for SoftWrapGuard {
+            fn drop(&mut self) {
+                kumo_wrap::set_soft_wrap_enabled(true);
+            }
+        }
+        let _guard = SoftWrapGuard;
+
+        let long_value = "hello there ".repeat(10).trim().to_string();
+
+        let make_request = |header_name: &str| InjectV1Request {
+            envelope_sender: "noreply@example.com".to_string(),
+            recipients: vec![Recipient {
+                email: "user@example.com".to_string(),
+                name: None,
+                substitutions: HashMap::new(),
+                metadata: HashMap::new(),
+            }],
+            substitutions: HashMap::new(),
+            content: Content::Builder {
+                text_body: Some("Hello".to_string()),
+                amp_html_body: None,
+                html_body: None,
+                attachments: vec![],
+                subject: None,
+                from: None,
+                reply_to: None,
+                headers: [(header_name.to_string(), long_value.clone())]
+                    .into_iter()
+                    .collect(),
+            },
+            deferred_spool: true,
+            deferred_generation: false,
+            trace_headers: Default::default(),
+            template_dialect: Default::default(),
+        };
+
+        kumo_wrap::set_soft_wrap_enabled(false);
+        let request = make_request("X-Long");
+        let compiled = request.compile().unwrap();
+        let generated = compiled
+            .expand_for_recip(
+                &request.recipients[0],
+                &request.substitutions,
+                &request.content,
+            )
+            .unwrap();
+        let parsed = MimePart::parse(generated.as_str()).unwrap();
+        k9::assert_equal!(
+            parsed
+                .headers()
+                .get_first("X-Long")
+                .unwrap()
+                .get_raw_value_string()
+                .unwrap(),
+            long_value.as_str()
+        );
+
+        kumo_wrap::set_soft_wrap_enabled(true);
+        let request = make_request("X-Long");
+        let compiled = request.compile().unwrap();
+        let generated = compiled
+            .expand_for_recip(
+                &request.recipients[0],
+                &request.substitutions,
+                &request.content,
+            )
+            .unwrap();
+        let parsed = MimePart::parse(generated.as_str()).unwrap();
+        let wrapped = parsed
+            .headers()
+            .get_first("X-Long")
+            .unwrap()
+            .get_raw_value_string()
+            .unwrap()
+            .to_string();
+        assert!(
+            wrapped.contains("\r\n\t"),
+            "expected soft wrap to resume once re-enabled, got: {wrapped}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_to_from_builder() {
         let mut request = InjectV1Request {
             envelope_sender: "noreply@example.com".to_string(),

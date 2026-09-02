@@ -64,6 +64,14 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
     )?;
 
     kumo_mod.set(
+        "set_header_soft_wrap_enabled",
+        lua.create_function(move |_, enabled: bool| {
+            kumo_wrap::set_soft_wrap_enabled(enabled);
+            Ok(())
+        })?,
+    )?;
+
+    kumo_mod.set(
         "set_httpinject_recipient_rate_limit",
         lua.create_function(move |_, spec: Option<String>| {
             let spec = match spec {
