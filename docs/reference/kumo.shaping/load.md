@@ -242,22 +242,37 @@ The following new actions are now supported:
    `source_selection_rate`, `connection_limit`, and
    `max_deliveries_per_connection`.
 
-   The size of the decrease/floor/ramp-up-step is specified using exactly
-   one of two styles, not both:
-    * **Percentage** - `decrease_percent=N, floor_percent=N,
-      ramp_step_percent=N`. `NAME` is decreased by `decrease_percent`
+   Unlike other automation actions, `duration` here is a fixed lifetime set
+   when the rule *first* triggers: it is not extended by later triggers or
+   by ramp-up steps. Choose `duration` large enough to cover the worst-case
+   number of ramp-up steps needed to fully recover from the floor back to
+   the original value at `ramp_up_interval` cadence. If `duration` elapses
+   before that recovery completes (or before the triggering condition stops
+   recurring), the override is removed and the field reverts to its
+   original value immediately; a later trigger then starts a new,
+   independent adjustment from scratch.
+
+   The size of the decrease, the floor, and the ramp-up step are each
+   specified independently, and each may use either of two styles:
+    * **Percentage** - `decrease_percent=N`, `floor_percent=N`,
+      `ramp_step_percent=N`. `NAME` is decreased by `decrease_percent`
       percent of its current value, never below `floor_percent` percent of
       its original value, and ramped up by `ramp_step_percent` percent per
-      step. `ramp_step_percent` defaults to `decrease_percent` if omitted.
-    * **Absolute count** - `decrease_amount=N, floor_amount=N,
-      ramp_step_amount=N`. `NAME` is decreased by a fixed count each
-      trigger, never below `floor_amount` (defaults to `0`, i.e. no floor
-      beyond the field's own minimum), and ramped up by a fixed count per
-      step. `ramp_step_amount` defaults to `decrease_amount` if omitted.
+      step.
+    * **Absolute count** - `decrease_amount=N`, `floor_amount=N`,
+      `ramp_step_amount=N`. `NAME` is decreased by a fixed count each
+      trigger, never below `floor_amount`, and ramped up by a fixed count
+      per step.
       {{since('dev', inline=True)}}
 
-   Mixing the two styles within one rule (e.g. `decrease_amount` together
-   with `floor_percent`) is rejected at config-load time.
+   `decrease` must be specified, using exactly one of `decrease_percent`/
+   `decrease_amount`. `floor` and `ramp_step` are each optional and may use
+   either style regardless of which style `decrease` used (e.g.
+   `decrease_percent` together with `floor_amount` is allowed) -- but for
+   a given field, at most one of its own `_percent`/`_amount` variants may
+   be set. If `floor` is omitted, it defaults to zero in `decrease`'s own
+   style (i.e. no floor beyond the field's own minimum). If `ramp_step` is
+   omitted, it defaults to `decrease` itself (same style and magnitude).
  * `{AdjustDomainConfig{name="NAME", ...}}` -
    same as `AdjustConfig`, but with `mx_rollup=false`, even if the rule was
    defined inside a domain where `mx_rollup=true`.

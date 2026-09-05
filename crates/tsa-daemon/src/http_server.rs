@@ -268,14 +268,11 @@ async fn create_ready_q_suspension(
 /// daemon's periodically-refreshed shaping config, then apply the
 /// AdjustConfig/AdjustDomainConfig down-path against it.
 ///
-/// If the field has no explicit base value anywhere in the shaping
-/// config for this domain, `connection_limit` and
-/// `max_deliveries_per_connection` fall back to `EgressPathConfig`'s
-/// struct-level defaults (since they always have one); the rate fields
-/// (`max_message_rate`/`max_connection_rate`/`source_selection_rate`)
-/// have no meaningful default (unset means unlimited), so those are
-/// logged and skipped rather than treated as an error that would abort
-/// processing of the rest of this record's other matched actions.
+/// If the field has no explicit value anywhere in the shaping config,
+/// `connection_limit`/`max_deliveries_per_connection` fall back to
+/// `EgressPathConfig`'s struct-level defaults; the rate fields have no
+/// meaningful default (unset means unlimited), so those are logged and
+/// skipped rather than erroring out the rest of this record's actions.
 async fn apply_adjust_config(
     action_hash: &ActionHash,
     rule: &Rule,
@@ -286,12 +283,6 @@ async fn apply_adjust_config(
     prefer_rollup: PreferRollup,
     shaping: &Shaping,
 ) -> anyhow::Result<()> {
-    // record.site is poorly named; it is really an identifier for the
-    // egress path. For matching purposes, we want just the site_name
-    // in the form produced by our MX resolution process.
-    // NOTE: this is coupled with the logic in
-    // ReadyQueueManager::compute_queue_name, and mirrors the equivalent
-    // computation in ShapingInner::match_rules.
     let site_name = record
         .site
         .trim_start_matches(&format!("{source}->"))
@@ -1081,19 +1072,11 @@ mod tests {
             .unwrap()
     }
 
-    /// Covers the "no base value, skip" branch of apply_adjust_config for
-    /// a rate field (max_message_rate/max_connection_rate/
-    /// source_selection_rate): when the merged shaping config has no
-    /// entry for the field, the function must log-and-return Ok(())
-    /// rather than treating it as an error or falling back to a default
-    /// (unlike connection_limit, rate fields have no meaningful
-    /// "unset" default).
-    ///
-    /// This also implicitly verifies that the function does not reach
-    /// TSA_STATE on this path: TSA_STATE is never initialized in this
-    /// test process, so `TSA_STATE.get().expect(...)` would panic if
-    /// apply_adjust_config incorrectly proceeded past the "no base
-    /// value" branch.
+    /// Rate fields have no meaningful "unset" default (unlike
+    /// connection_limit), so a missing config entry must log-and-return
+    /// `Ok(())`, not error. Also implicitly checks the function never
+    /// reaches `TSA_STATE` on this path -- it's uninitialized here, so
+    /// `TSA_STATE.get().expect(...)` would panic if it did.
     #[tokio::test]
     async fn test_apply_adjust_config_skips_when_no_base_rate_value() {
         let shaping = make_shaping(&[r#"

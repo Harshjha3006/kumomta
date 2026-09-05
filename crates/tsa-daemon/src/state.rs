@@ -5,6 +5,7 @@ use crate::http_server::{
 };
 use anyhow::Context;
 use chrono::{DateTime, Utc};
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use kumo_api_types::shaping::{
     Action, AdjustmentMagnitude, EgressPathConfigAdjustment, EgressPathConfigValue,
@@ -276,12 +277,24 @@ fn magnitude_decrease(decrease: AdjustmentMagnitude, current_limit: u64) -> u64 
     }
 }
 
-/// Apply a ramp-up step magnitude to the current value: a percentage of
-/// the current value, or a fixed absolute count added to it. The percent
-/// case guarantees monotonic progress even when naive rounding would
-/// otherwise stall on small integer limits (see the regression test for
-/// this); the amount case always progresses by at least
-/// `ramp_step_amount` (validated > 0), so no equivalent guard is needed.
+/// The down-path's per-trigger step, shared by both the create-new and
+/// update-existing cases in `create_or_update_adaptive_override`: decrease
+/// `current_limit` by `decrease`, clamped at `floor` of `original_limit`.
+fn apply_down_step(
+    floor: AdjustmentMagnitude,
+    decrease: AdjustmentMagnitude,
+    original_limit: u64,
+    current_limit: u64,
+) -> u64 {
+    let floor_limit = magnitude_floor(floor, original_limit);
+    let decreased = magnitude_decrease(decrease, current_limit);
+    decreased.max(floor_limit)
+}
+
+/// Apply a ramp-up step: percentage of current value, or a fixed amount
+/// added. Percent mode forces strictly-greater-than-current progress,
+/// since naive rounding can stall on small integers; amount mode always
+/// progresses because `ramp_step_amount` is validated > 0.
 fn magnitude_increase(ramp_step: AdjustmentMagnitude, current_limit: u64) -> u64 {
     match ramp_step {
         AdjustmentMagnitude::Percent(p) => {
@@ -308,9 +321,45 @@ pub struct AdaptiveOverride {
     pub floor: AdjustmentMagnitude,
     pub ramp_step: AdjustmentMagnitude,
     pub ramp_up_interval_secs: i64,
-    pub safety_duration_secs: i64,
     pub last_activity: DateTime<Utc>,
     pub expires: DateTime<Utc>,
+}
+
+/// What `prune_adaptive_overrides` should do with an entry as of a given
+/// instant. Computed once by `ramp_decision`, consumed from an unlocked
+/// pre-filter and (recomputed) the locked mutation.
+enum RampDecision {
+    NotDue,
+    /// `expires` has passed: discard the entry. The only removal path --
+    /// an entry that fully recovers before `expires` is clamped at
+    /// `original_limit` (`StepTo`) rather than removed early, so a rule's
+    /// `duration` is the sole thing that ends an episode.
+    Remove,
+    /// Ramp up to this new `current_limit`, clamped at `original_limit`.
+    StepTo(u64),
+}
+
+/// Decide what to do with `over` as of `now`. Pure, so safe to call twice:
+/// once against a lock-free snapshot to cheaply skip idle entries, and
+/// once more against the live value after locking (see
+/// `prune_adaptive_overrides`).
+fn ramp_decision(
+    over: &AdaptiveOverride,
+    now: &DateTime<Utc>,
+    now_ts: UnixTimeStamp,
+) -> RampDecision {
+    if *now >= over.expires {
+        return RampDecision::Remove;
+    }
+    if over.current_limit >= over.original_limit {
+        return RampDecision::NotDue;
+    }
+    let last_activity_ts = to_unix_ts(&over.last_activity);
+    if now_ts - last_activity_ts < over.ramp_up_interval_secs {
+        return RampDecision::NotDue;
+    }
+    let increased = magnitude_increase(over.ramp_step, over.current_limit);
+    RampDecision::StepTo(increased.min(over.original_limit))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
@@ -446,26 +495,36 @@ impl TsaState {
         let expires = now + rule.duration;
 
         if Utc::now() >= expires {
-            // Skip already expired entry, same as the sibling insert_*
-            // methods in this file. This is currently redundant with the
-            // caller's own pre-filtering in http_server.rs, but the
-            // invariant should be enforced locally here too rather than
-            // solely relied upon from the caller.
+            // Skip already-expired entry, same as the sibling insert_*
+            // methods (redundant with the caller's own pre-filter, but
+            // enforced locally too).
             return Ok(());
         }
 
-        // Parsing `original_value` is only needed to seed a brand new
-        // entry: an already-existing entry carries its own
-        // original_limit/template, so a parse failure on a later trigger
-        // must not abort processing of the rest of this record's other
-        // matched actions (consistent with the "log-and-skip" intent
-        // documented on the "no base value" branch in
-        // http_server.rs::apply_adjust_config).
-        if !self.adaptive_overrides.contains_key(scope) {
-            let (original_limit, template) = parse_adaptive_field_value(&adj.name, original_value)?;
-            self.adaptive_overrides
-                .entry(scope.clone())
-                .or_insert_with(|| AdaptiveOverride {
+        // Single `entry()` call holds this scope's shard lock for the whole
+        // read-or-create-then-step decision, atomic against a concurrent
+        // prune tick or another trigger for this scope. `original_value` is
+        // only parsed for a brand-new entry, so a parse failure on a later
+        // trigger (existing entry) can't abort the rest of this record's
+        // other matched actions.
+        match self.adaptive_overrides.entry(scope.clone()) {
+            Entry::Occupied(mut entry) => {
+                let over = entry.get_mut();
+                over.current_limit = apply_down_step(
+                    over.floor,
+                    over.decrease,
+                    over.original_limit,
+                    over.current_limit,
+                );
+                over.last_activity = now;
+                tracing::debug!("adaptive override down-step {scope:?} = {:?}", *over);
+            }
+            Entry::Vacant(entry) => {
+                let (original_limit, template) =
+                    parse_adaptive_field_value(&adj.name, original_value)?;
+                let current_limit =
+                    apply_down_step(adj.floor, adj.decrease, original_limit, original_limit);
+                let over = AdaptiveOverride {
                     domain: domain.to_string(),
                     mx_rollup: match prefer_rollup {
                         PreferRollup::Yes => rule.was_rollup,
@@ -476,31 +535,19 @@ impl TsaState {
                     field_name: adj.name.clone(),
                     template,
                     original_limit,
-                    current_limit: original_limit,
+                    current_limit,
                     decrease: adj.decrease,
                     floor: adj.floor,
                     ramp_step: adj.ramp_step,
                     ramp_up_interval_secs: adj.ramp_up_interval.as_secs() as i64,
-                    safety_duration_secs: rule.duration.as_secs() as i64,
                     last_activity: now,
                     expires,
-                });
+                };
+                tracing::debug!("new adaptive override {scope:?} = {over:?}");
+                entry.insert(over);
+            }
         }
 
-        let Some(mut entry) = self.adaptive_overrides.get_mut(scope) else {
-            // Extremely narrow race: the entry we just confirmed/inserted
-            // was concurrently removed (e.g. by the prune tick) before we
-            // could grab it. Nothing further to do for this trigger.
-            return Ok(());
-        };
-
-        let floor_limit = magnitude_floor(entry.floor, entry.original_limit);
-        let decreased = magnitude_decrease(entry.decrease, entry.current_limit);
-        entry.current_limit = decreased.max(floor_limit);
-        entry.last_activity = now;
-        entry.expires = expires;
-
-        tracing::debug!("adaptive override down-step {scope:?} = {:?}", *entry);
         Ok(())
     }
 
@@ -972,49 +1019,18 @@ impl TsaState {
         let start = Instant::now();
         let now_ts = to_unix_ts(now);
 
-        // Cheap, read-only pre-filter: most entries in steady state are
-        // simply waiting out their ramp_up_interval, so deciding that here
-        // (during the read-only iteration below) avoids a remove_if +
-        // get_mut (two DashMap write-lock attempts) per idle entry on every
-        // 60s tick -- only entries that are actually due get carried into
-        // the write-locking phase.
-        let is_actionable = |over: &AdaptiveOverride| {
-            if *now >= over.expires {
-                return true;
-            }
-            if over.current_limit >= over.original_limit {
-                return false;
-            }
-            let last_activity_ts = to_unix_ts(&over.last_activity);
-            now_ts - last_activity_ts >= over.ramp_up_interval_secs
-        };
-
-        // Re-evaluated fresh at the moment of each DashMap call below (never
-        // from a snapshot captured during the scan), so a concurrent
-        // create_or_update_adaptive_override (the down-path) landing on the
-        // same key between our scan and our mutate can't be clobbered by a
-        // stale step or have its just-refreshed `expires` ignored.
-        let is_removable = |over: &AdaptiveOverride| {
-            if *now >= over.expires {
-                return true;
-            }
-            if over.current_limit >= over.original_limit {
-                return false;
-            }
-            let last_activity_ts = to_unix_ts(&over.last_activity);
-            if now_ts - last_activity_ts < over.ramp_up_interval_secs {
-                return false;
-            }
-            let increased = magnitude_increase(over.ramp_step, over.current_limit);
-            increased >= over.original_limit
-        };
-
+        // Cheap read-only pre-filter: most entries are just waiting out
+        // `ramp_up_interval` (`NotDue`), so deciding that here avoids a
+        // write-lock attempt below for every idle entry on every tick.
         let keys: Vec<ActionHash> = self
             .adaptive_overrides
             .iter()
             .filter_map(|entry| {
                 visited += 1;
-                is_actionable(entry.value()).then(|| entry.key().clone())
+                match ramp_decision(entry.value(), now, now_ts) {
+                    RampDecision::NotDue => None,
+                    RampDecision::Remove | RampDecision::StepTo(_) => Some(entry.key().clone()),
+                }
             })
             .collect();
 
@@ -1022,39 +1038,31 @@ impl TsaState {
         let mut num_stepped = 0;
 
         for key in keys {
-            if self
+            // `remove_if_mut` holds this key's shard lock for the closure,
+            // so `ramp_decision` is recomputed against the live value
+            // rather than trusting the possibly-stale snapshot above --
+            // `NotDue` here just means a concurrent down-path trigger
+            // already handled it. Same primitive every sibling prune_*
+            // method uses (the `_mut` variant, since `StepTo` mutates in
+            // place); a key that's vanished by now is just `None`, same as
+            // a stale key would be for `remove_if` elsewhere in this file.
+            let mut stepped = false;
+            let removed = self
                 .adaptive_overrides
-                .remove_if(&key, |_key, over| is_removable(over))
-                .is_some()
-            {
+                .remove_if_mut(&key, |_key, over| match ramp_decision(over, now, now_ts) {
+                    RampDecision::NotDue => false,
+                    RampDecision::Remove => true,
+                    RampDecision::StepTo(increased) => {
+                        over.current_limit = increased;
+                        over.last_activity = *now;
+                        stepped = true;
+                        false
+                    }
+                })
+                .is_some();
+            if removed {
                 num_removed += 1;
-                continue;
-            }
-
-            // Not removed: re-fetch and recompute the step decision entirely
-            // from live state (not the scan snapshot) before mutating.
-            if let Some(mut entry) = self.adaptive_overrides.get_mut(&key) {
-                if entry.current_limit >= entry.original_limit {
-                    continue;
-                }
-                let last_activity_ts = to_unix_ts(&entry.last_activity);
-                if now_ts - last_activity_ts < entry.ramp_up_interval_secs {
-                    continue;
-                }
-                // Keep in lockstep with the identical computation in the
-                // `is_removable` closure above.
-                let increased = magnitude_increase(entry.ramp_step, entry.current_limit);
-                if increased >= entry.original_limit {
-                    // Extremely narrow window: became eligible for full
-                    // recovery between the remove_if check above and this
-                    // get_mut. Leave it for the next tick (60s later) rather
-                    // than removing here without an atomic re-check.
-                    continue;
-                }
-                let safety = entry.safety_duration_secs.max(0) as u64;
-                entry.current_limit = increased;
-                entry.last_activity = *now;
-                entry.expires = *now + std::time::Duration::from_secs(safety);
+            } else if stepped {
                 num_stepped += 1;
             }
         }
@@ -1242,6 +1250,7 @@ pub async fn load_state() -> anyhow::Result<()> {
     let state = Arc::into_inner(import_holder).expect("only we hold a ref");
 
     let num_config_overrides = state.config_overrides.len();
+    let num_adaptive_overrides = state.adaptive_overrides.len();
     let num_schedq_bounces = state.schedq_bounces.len();
     let num_schedq_suspensions = state.schedq_suspensions.len();
     let num_readyq_suspensions = state.readyq_suspensions.len();
@@ -1249,6 +1258,7 @@ pub async fn load_state() -> anyhow::Result<()> {
 
     tracing::info!(
         "State has {num_config_overrides} config overrides, \
+        {num_adaptive_overrides} adaptive overrides, \
         {num_schedq_bounces} schedq bounces, {num_schedq_suspensions} schedq suspensions, \
         {num_readyq_suspensions} readyq suspensions, {num_events} events."
     );
@@ -1275,6 +1285,7 @@ pub async fn save_state(background: bool) -> anyhow::Result<()> {
     let write = start.elapsed();
 
     let num_config_overrides = state.config_overrides.len();
+    let num_adaptive_overrides = state.adaptive_overrides.len();
     let num_schedq_bounces = state.schedq_bounces.len();
     let num_schedq_suspensions = state.schedq_suspensions.len();
     let num_readyq_suspensions = state.readyq_suspensions.len();
@@ -1282,6 +1293,7 @@ pub async fn save_state(background: bool) -> anyhow::Result<()> {
 
     let message = format!(
         "stored {} of data to {path}. State has {num_config_overrides} config overrides, \
+        {num_adaptive_overrides} adaptive overrides, \
         {num_schedq_bounces} schedq bounces, {num_schedq_suspensions} schedq suspensions, \
         {num_readyq_suspensions} readyq suspensions, {num_events} events. \
         (Extract took {extract:?}, write took {write:?})",
@@ -1741,12 +1753,10 @@ mod tests {
             90
         );
 
-        // Second trigger: an original_value that would fail to parse as a
-        // connection_limit (LimitSpec rejects booleans). Since the entry
-        // already exists, parsing must be skipped entirely -- the call
-        // should still succeed (not propagate an Err that would abort the
-        // rest of the log record's other matched actions) and continue
-        // compounding from the existing current_limit.
+        // Second trigger: original_value would fail to parse as a
+        // connection_limit (LimitSpec rejects booleans), but the entry
+        // already exists so parsing is skipped -- must still succeed and
+        // compound from the existing current_limit.
         let record = make_record(Utc::now());
         state
             .create_or_update_adaptive_override(
@@ -1826,11 +1836,9 @@ mod tests {
     /// original_limit=10, floor_percent=25 (floor=3) and
     /// ramp_step_percent=10, naive rounding of `3 * 1.10 = 3.3` rounds
     /// back down to 3, so the ramp-up step made no progress and the
-    /// entry never reached original_limit -- nor got pruned by the
-    /// safety-net expiry, since the step branch kept refreshing
-    /// `expires` on every tick even though nothing actually changed. The
-    /// fix forces each step to be strictly greater than the prior
-    /// current_limit, guaranteeing forward progress every tick.
+    /// entry never reached original_limit. The fix forces each step to
+    /// be strictly greater than the prior current_limit, guaranteeing
+    /// forward progress every tick.
     #[tokio::test]
     async fn test_up_path_progresses_on_small_integer_limits() {
         let state = TsaState::default();
@@ -1863,7 +1871,7 @@ mod tests {
 
         let mut last_seen = 3u64;
         for _ in 0..40 {
-            if state.adaptive_overrides.get(&scope).is_none() {
+            if state.adaptive_overrides.get(&scope).unwrap().current_limit >= 10 {
                 break;
             }
             {
@@ -1873,24 +1881,24 @@ mod tests {
             let now = Utc::now();
             state.prune_adaptive_overrides(&now, false).await;
 
-            if let Some(entry) = state.adaptive_overrides.get(&scope) {
-                assert!(
-                    entry.current_limit > last_seen,
-                    "ramp-up stalled at {last_seen}: made no progress on this tick"
-                );
-                last_seen = entry.current_limit;
-            }
+            let entry = state.adaptive_overrides.get(&scope).unwrap();
+            assert!(
+                entry.current_limit > last_seen,
+                "ramp-up stalled at {last_seen}: made no progress on this tick"
+            );
+            last_seen = entry.current_limit;
         }
 
-        assert!(
-            state.adaptive_overrides.get(&scope).is_none(),
-            "entry should have fully recovered to original_limit and been removed, \
+        assert_eq!(
+            state.adaptive_overrides.get(&scope).unwrap().current_limit,
+            10,
+            "entry should have fully recovered to original_limit, \
              but is stuck at current_limit={last_seen}"
         );
     }
 
     #[tokio::test]
-    async fn test_up_path_removes_entry_on_full_recovery() {
+    async fn test_up_path_clamps_to_original_limit_on_full_recovery() {
         let state = TsaState::default();
         let record = make_record(Utc::now());
         let rule = simple_rule();
@@ -1920,9 +1928,36 @@ mod tests {
             let mut entry = state.adaptive_overrides.get_mut(&scope).unwrap();
             entry.last_activity = Utc::now() - chrono::Duration::seconds(1000);
         }
-        // 80 * 1.5 = 120 >= original (100) -> fully recovered, entry removed.
+        // 80 * 1.5 = 120, clamped to original (100); entry is kept (not
+        // removed early) -- only `expires` ever removes an entry.
         let now = Utc::now();
         state.prune_adaptive_overrides(&now, false).await;
+        let (current_limit, expires) = {
+            let recovered = state.adaptive_overrides.get(&scope).unwrap();
+            (recovered.current_limit, recovered.expires)
+        };
+        assert_eq!(current_limit, 100);
+
+        // Fully recovered, so `current_limit >= original_limit` makes
+        // every further tick a no-op right up until `expires`.
+        {
+            let mut entry = state.adaptive_overrides.get_mut(&scope).unwrap();
+            entry.last_activity = Utc::now() - chrono::Duration::seconds(1000);
+        }
+        let now = Utc::now();
+        state.prune_adaptive_overrides(&now, false).await;
+        assert_eq!(
+            state.adaptive_overrides.get(&scope).unwrap().current_limit,
+            100
+        );
+        assert_eq!(
+            state.adaptive_overrides.get(&scope).unwrap().expires,
+            expires
+        );
+
+        // Only the original fixed `expires` deadline removes it.
+        let past_deadline = expires + chrono::Duration::seconds(1);
+        state.prune_adaptive_overrides(&past_deadline, false).await;
         assert!(state.adaptive_overrides.get(&scope).is_none());
     }
 
@@ -1972,8 +2007,12 @@ mod tests {
         }
         let now = Utc::now();
         state.prune_adaptive_overrides(&now, false).await;
-        // 95 + 25 = 120 >= original (100) -> fully recovered, entry removed.
-        assert!(state.adaptive_overrides.get(&scope).is_none());
+        // 95 + 25 = 120, clamped to original (100); entry is kept (not
+        // removed early) -- only `expires` ever removes an entry.
+        assert_eq!(
+            state.adaptive_overrides.get(&scope).unwrap().current_limit,
+            100
+        );
     }
 
     #[tokio::test]
@@ -2001,6 +2040,82 @@ mod tests {
 
         let far_future = Utc::now() + chrono::Duration::hours(1);
         state.prune_adaptive_overrides(&far_future, false).await;
+        assert!(state.adaptive_overrides.get(&scope).is_none());
+    }
+
+    /// `expires` is fixed at creation and never re-armed by later
+    /// down-steps or ramp-up steps, so `duration` bounds one episode's
+    /// lifetime regardless of activity; a still-recovering entry is
+    /// removed once that deadline passes, and a later trigger starts a
+    /// fresh episode.
+    #[tokio::test]
+    async fn test_expires_is_fixed_at_creation_and_not_extended_by_activity() {
+        let state = TsaState::default();
+        let record = make_record(Utc::now());
+        let rule = simple_rule(); // duration = 30m
+        let a = adj("connection_limit", 20.0, 25.0, 10.0);
+        let original = toml::Value::Integer(100);
+        let scope =
+            ActionHash::from_rule_and_record(&rule, &Action::AdjustConfig(a.clone()), &record);
+
+        state
+            .create_or_update_adaptive_override(
+                &scope,
+                &rule,
+                &record,
+                &a,
+                "example.com",
+                "unspecified",
+                PreferRollup::Yes,
+                &original,
+            )
+            .unwrap();
+        let created_expires = state.adaptive_overrides.get(&scope).unwrap().expires;
+
+        // A second down-step trigger must not push `expires` out further.
+        let record2 = make_record(Utc::now());
+        state
+            .create_or_update_adaptive_override(
+                &scope,
+                &rule,
+                &record2,
+                &a,
+                "example.com",
+                "unspecified",
+                PreferRollup::Yes,
+                &original,
+            )
+            .unwrap();
+        {
+            let after_second_down_step = state.adaptive_overrides.get(&scope).unwrap();
+            assert_eq!(after_second_down_step.current_limit, 64, "80 * 0.8 = 64");
+            assert_eq!(
+                after_second_down_step.expires, created_expires,
+                "a repeat down-path trigger must not extend expires"
+            );
+        }
+
+        // A successful ramp-up step must not push `expires` out either.
+        {
+            let mut entry = state.adaptive_overrides.get_mut(&scope).unwrap();
+            entry.last_activity = Utc::now() - chrono::Duration::seconds(1000);
+        }
+        let now = Utc::now();
+        state.prune_adaptive_overrides(&now, false).await;
+        {
+            let entry = state.adaptive_overrides.get(&scope).unwrap();
+            assert_eq!(entry.current_limit, 70, "64 * 1.10 = 70.4, rounds to 70");
+            assert_eq!(
+                entry.expires, created_expires,
+                "a ramp-up step must not extend expires"
+            );
+        }
+
+        // The original fixed deadline still removes the entry even
+        // though it's still below original_limit and had activity right
+        // up until this point.
+        let past_deadline = created_expires + chrono::Duration::seconds(1);
+        state.prune_adaptive_overrides(&past_deadline, false).await;
         assert!(state.adaptive_overrides.get(&scope).is_none());
     }
 

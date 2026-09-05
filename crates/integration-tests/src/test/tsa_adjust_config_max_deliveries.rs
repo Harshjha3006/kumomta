@@ -2,13 +2,8 @@ use crate::kumod::{generate_message_text, DaemonWithTsa, MailGenParams};
 use kumo_log_types::RecordType::TransientFailure;
 use std::time::Duration;
 
-// AdjustConfig on max_deliveries_per_connection: this field has no explicit
-// base value for this domain in shaping.toml, so the daemon must fall back
-// to EgressPathConfig's struct-level default (1024) -- the same fallback
-// path connection_limit already exercises, but this is the first end-to-end
-// coverage for max_deliveries_per_connection specifically, since unit-level
-// coverage of this fallback branch would require initializing the global
-// TSA_STATE, which isn't practical outside a real daemon process.
+// AdjustConfig on max_deliveries_per_connection: no explicit base value for
+// this domain, so it falls back to EgressPathConfig's default (1024).
 // decrease_amount=24 -> 1024 - 24 = 1000.
 #[tokio::test]
 async fn tsa_adjust_config_max_deliveries_per_connection() -> anyhow::Result<()> {

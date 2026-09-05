@@ -207,8 +207,10 @@ pub const ADAPTIVE_SUPPORTED_FIELDS: &[&str] = &[
 ];
 
 /// A relative adjustment magnitude: either a percentage of the relevant
-/// base value, or a fixed absolute count. A single AdjustConfig rule uses
-/// exactly one style for all of decrease/floor/ramp_step -- see
+/// base value, or a fixed absolute count. `decrease`/`floor`/`ramp_step` on
+/// a given `EgressPathConfigAdjustment` are validated independently, so a
+/// single AdjustConfig rule may freely mix styles across the three (e.g.
+/// `decrease_percent` with `floor_amount`) -- see
 /// `EgressPathConfigAdjustmentUnchecked`'s `TryFrom` validation.
 #[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq)]
 pub enum AdjustmentMagnitude {
@@ -235,8 +237,8 @@ impl Hash for AdjustmentMagnitude {
 /// EgressPathConfig field: decrease it by `decrease` each time the
 /// enclosing rule triggers, and once triggering stops for
 /// `ramp_up_interval`, step it back up by `ramp_step` until it reaches its
-/// original value. `decrease`/`floor`/`ramp_step` are always the same
-/// `AdjustmentMagnitude` variant for a given rule -- see
+/// original value. `decrease`, `floor`, and `ramp_step` are each
+/// independently either `Percent` or `Amount` -- see
 /// `EgressPathConfigAdjustmentUnchecked`'s `TryFrom` validation.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(
@@ -280,88 +282,128 @@ pub struct EgressPathConfigAdjustmentUnchecked {
     pub ramp_up_interval: Duration,
 }
 
+/// `decrease` must be specified and picks its own style: exactly one of
+/// `decrease_percent`/`decrease_amount`.
+fn decrease_magnitude(
+    u: &EgressPathConfigAdjustmentUnchecked,
+) -> anyhow::Result<AdjustmentMagnitude> {
+    match (u.decrease_percent, u.decrease_amount) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("specify exactly one of decrease_percent or decrease_amount, not both")
+        }
+        (None, None) => anyhow::bail!("must specify one of decrease_percent or decrease_amount"),
+        (Some(p), None) => {
+            if p.is_nan() || p <= 0.0 || p > 100.0 {
+                anyhow::bail!("decrease_percent must be > 0 and <= 100, got {p}");
+            }
+            Ok(AdjustmentMagnitude::Percent(p))
+        }
+        (None, Some(a)) => {
+            if a == 0 {
+                anyhow::bail!("decrease_amount must be >= zero");
+            }
+            Ok(AdjustmentMagnitude::Amount(a))
+        }
+    }
+}
+
+/// `floor` picks its own style independently of `decrease`: at most one of
+/// `floor_percent`/`floor_amount`. If neither is set, defaults to zero in
+/// `decrease`'s own style (i.e. no floor beyond the field's own minimum).
+fn floor_magnitude(
+    u: &EgressPathConfigAdjustmentUnchecked,
+    decrease: AdjustmentMagnitude,
+) -> anyhow::Result<AdjustmentMagnitude> {
+    match (u.floor_percent, u.floor_amount) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("specify at most one of floor_percent or floor_amount, not both")
+        }
+        (Some(p), None) => {
+            if p.is_nan() || p < 0.0 || p >= 100.0 {
+                anyhow::bail!("floor_percent must be >= 0 and < 100, got {p}");
+            }
+            Ok(AdjustmentMagnitude::Percent(p))
+        }
+        (None, Some(a)) => Ok(AdjustmentMagnitude::Amount(a)),
+        (None, None) => Ok(zero_like(decrease)),
+    }
+}
+
+/// `ramp_step` picks its own style independently of `decrease`/`floor`: at
+/// most one of `ramp_step_percent`/`ramp_step_amount`. If neither is set,
+/// defaults to `decrease` itself (same style and magnitude).
+fn ramp_step_magnitude(
+    u: &EgressPathConfigAdjustmentUnchecked,
+    decrease: AdjustmentMagnitude,
+) -> anyhow::Result<AdjustmentMagnitude> {
+    match (u.ramp_step_percent, u.ramp_step_amount) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("specify at most one of ramp_step_percent or ramp_step_amount, not both")
+        }
+        (Some(p), None) => {
+            if p.is_nan() || p <= 0.0 || p >= 100.0 {
+                anyhow::bail!("ramp_step_percent must be > 0, got {p}");
+            }
+            Ok(AdjustmentMagnitude::Percent(p))
+        }
+        (None, Some(a)) => {
+            if a == 0 {
+                anyhow::bail!("ramp_step_amount must be >= zero");
+            }
+            Ok(AdjustmentMagnitude::Amount(a))
+        }
+        (None, None) => Ok(decrease),
+    }
+}
+
+/// Zero, in the same `AdjustmentMagnitude` style as `m`.
+fn zero_like(m: AdjustmentMagnitude) -> AdjustmentMagnitude {
+    match m {
+        AdjustmentMagnitude::Percent(_) => AdjustmentMagnitude::Percent(0.0),
+        AdjustmentMagnitude::Amount(_) => AdjustmentMagnitude::Amount(0),
+    }
+}
+
+/// `ramp_up_interval` must be positive: zero would mean "eligible to step
+/// up again immediately", collapsing the ramp into an instant snap-back.
+fn ramp_up_interval_duration(u: &EgressPathConfigAdjustmentUnchecked) -> anyhow::Result<Duration> {
+    if u.ramp_up_interval.is_zero() {
+        anyhow::bail!("ramp_up_interval must be greater than zero");
+    }
+    Ok(u.ramp_up_interval)
+}
+
+/// `name` must be one of the numeric rate/limit fields a relative
+/// adjustment is meaningful for.
+fn validate_adjustable_field_name(name: &str) -> anyhow::Result<()> {
+    if !ADAPTIVE_SUPPORTED_FIELDS.contains(&name) {
+        anyhow::bail!(
+            "AdjustConfig/AdjustDomainConfig field {:?} is not supported; \
+             supported fields are: {}",
+            name,
+            ADAPTIVE_SUPPORTED_FIELDS.join(", ")
+        );
+    }
+    Ok(())
+}
+
 impl TryFrom<EgressPathConfigAdjustmentUnchecked> for EgressPathConfigAdjustment {
     type Error = anyhow::Error;
 
     fn try_from(u: EgressPathConfigAdjustmentUnchecked) -> anyhow::Result<Self> {
-        if !ADAPTIVE_SUPPORTED_FIELDS.contains(&u.name.as_str()) {
-            anyhow::bail!(
-                "AdjustConfig/AdjustDomainConfig field {:?} is not supported; \
-                 supported fields are: {}",
-                u.name,
-                ADAPTIVE_SUPPORTED_FIELDS.join(", ")
-            );
-        }
+        validate_adjustable_field_name(&u.name)?;
 
-        let (decrease, floor, ramp_step) = match (u.decrease_percent, u.decrease_amount) {
-            (Some(_), Some(_)) => {
-                anyhow::bail!(
-                    "specify exactly one of decrease_percent or decrease_amount, not both"
-                );
-            }
-            (None, None) => {
-                anyhow::bail!("must specify one of decrease_percent or decrease_amount");
-            }
-            (Some(decrease_percent), None) => {
-                if u.floor_amount.is_some() || u.ramp_step_amount.is_some() {
-                    anyhow::bail!(
-                        "decrease_percent cannot be combined with floor_amount/ramp_step_amount; \
-                         use floor_percent/ramp_step_percent instead"
-                    );
-                }
-                if decrease_percent.is_nan() || decrease_percent <= 0.0 || decrease_percent > 100.0
-                {
-                    anyhow::bail!(
-                        "decrease_percent must be > 0 and <= 100, got {decrease_percent}"
-                    );
-                }
-                let floor_percent = u.floor_percent.unwrap_or(0.0);
-                if floor_percent.is_nan() || floor_percent < 0.0 || floor_percent >= 100.0 {
-                    anyhow::bail!("floor_percent must be >= 0 and < 100, got {floor_percent}");
-                }
-                let ramp_step_percent = u.ramp_step_percent.unwrap_or(decrease_percent);
-                if ramp_step_percent.is_nan() || ramp_step_percent <= 0.0 {
-                    anyhow::bail!("ramp_step_percent must be > 0, got {ramp_step_percent}");
-                }
-                (
-                    AdjustmentMagnitude::Percent(decrease_percent),
-                    AdjustmentMagnitude::Percent(floor_percent),
-                    AdjustmentMagnitude::Percent(ramp_step_percent),
-                )
-            }
-            (None, Some(decrease_amount)) => {
-                if u.floor_percent.is_some() || u.ramp_step_percent.is_some() {
-                    anyhow::bail!(
-                        "decrease_amount cannot be combined with floor_percent/ramp_step_percent; \
-                         use floor_amount/ramp_step_amount instead"
-                    );
-                }
-                if decrease_amount == 0 {
-                    anyhow::bail!("decrease_amount must be greater than zero");
-                }
-                let floor_amount = u.floor_amount.unwrap_or(0);
-                let ramp_step_amount = u.ramp_step_amount.unwrap_or(decrease_amount);
-                if ramp_step_amount == 0 {
-                    anyhow::bail!("ramp_step_amount must be greater than zero");
-                }
-                (
-                    AdjustmentMagnitude::Amount(decrease_amount),
-                    AdjustmentMagnitude::Amount(floor_amount),
-                    AdjustmentMagnitude::Amount(ramp_step_amount),
-                )
-            }
-        };
-
-        if u.ramp_up_interval.is_zero() {
-            anyhow::bail!("ramp_up_interval must be greater than zero");
-        }
+        let decrease = decrease_magnitude(&u)?;
+        let floor = floor_magnitude(&u, decrease)?;
+        let ramp_step = ramp_step_magnitude(&u, decrease)?;
+        let ramp_up_interval = ramp_up_interval_duration(&u)?;
 
         Ok(Self {
             name: u.name,
             decrease,
             floor,
             ramp_step,
-            ramp_up_interval: u.ramp_up_interval,
+            ramp_up_interval,
         })
     }
 }
@@ -2913,28 +2955,71 @@ MergedEntry {
     }
 
     #[test]
-    fn test_adjust_config_rejects_mixed_percent_and_amount_fields() {
-        // decrease_percent with floor_amount: not allowed.
-        let err = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
+    fn test_adjust_config_allows_mixed_percent_and_amount_fields() {
+        // decrease_percent with floor_amount: each field picks its own
+        // style independently.
+        let adj = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
             name: "max_message_rate".to_string(),
             decrease_percent: Some(10.0),
             floor_amount: Some(5),
             ramp_up_interval: std::time::Duration::from_secs(900),
             ..Default::default()
         })
-        .unwrap_err();
-        assert!(err.to_string().contains("cannot be combined"), "{err}");
+        .unwrap();
+        assert_eq!(adj.decrease, AdjustmentMagnitude::Percent(10.0));
+        assert_eq!(adj.floor, AdjustmentMagnitude::Amount(5));
+        // ramp_step wasn't specified, so it defaults to decrease's style.
+        assert_eq!(adj.ramp_step, AdjustmentMagnitude::Percent(10.0));
 
-        // decrease_amount with ramp_step_percent: not allowed.
-        let err = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
+        // decrease_amount with ramp_step_percent, floor left at its
+        // decrease-style default (Amount(0)).
+        let adj = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
             name: "connection_limit".to_string(),
             decrease_amount: Some(5),
             ramp_step_percent: Some(10.0),
             ramp_up_interval: std::time::Duration::from_secs(900),
             ..Default::default()
         })
+        .unwrap();
+        assert_eq!(adj.decrease, AdjustmentMagnitude::Amount(5));
+        assert_eq!(adj.floor, AdjustmentMagnitude::Amount(0));
+        assert_eq!(adj.ramp_step, AdjustmentMagnitude::Percent(10.0));
+    }
+
+    #[test]
+    fn test_adjust_config_rejects_both_floor_styles() {
+        let err = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
+            name: "max_message_rate".to_string(),
+            decrease_percent: Some(10.0),
+            floor_percent: Some(25.0),
+            floor_amount: Some(5),
+            ramp_up_interval: std::time::Duration::from_secs(900),
+            ..Default::default()
+        })
         .unwrap_err();
-        assert!(err.to_string().contains("cannot be combined"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("at most one of floor_percent or floor_amount"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_adjust_config_rejects_both_ramp_step_styles() {
+        let err = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
+            name: "max_message_rate".to_string(),
+            decrease_percent: Some(10.0),
+            ramp_step_percent: Some(10.0),
+            ramp_step_amount: Some(5),
+            ramp_up_interval: std::time::Duration::from_secs(900),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("at most one of ramp_step_percent or ramp_step_amount"),
+            "{err}"
+        );
     }
 
     #[test]

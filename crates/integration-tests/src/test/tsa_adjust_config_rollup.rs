@@ -3,22 +3,12 @@ use kumo_log_types::RecordType::TransientFailure;
 use std::time::Duration;
 
 // Confirms AdjustDomainConfig forces mx_rollup=false while AdjustConfig
-// follows the enclosing rule's scope, exercised end-to-end via two
-// "default"-scoped automation rules (both domains fall back to "default"
-// since neither has its own domain-specific shaping.toml block, and both
-// resolve via the same real wildcard MX to loopback.dummy-mx.wezfurlong.org,
-// matching tsa_basic_automation's existing pattern).
-//
-// The rollup distinction is only observable at "default"/site scope: a
-// domain-specific rule (like the connection_limit rules used by the other
-// AdjustConfig tests) always has was_rollup=false regardless of which of
-// the two actions is used, since was_rollup is only set true for
-// default/site-scope matches.
-//
-// The two rules use different decrease_percent values (50 vs 25) so their
-// resulting connection_limit values (16 vs 24) are distinguishable -- this
-// lets each lookup below unambiguously identify which entry (if any) it
-// found, rather than two rules landing on the same value by coincidence.
+// follows the enclosing rule's scope. Uses two "default"-scoped rules,
+// since the rollup distinction is only observable at that scope (a
+// domain-specific rule always has was_rollup=false regardless of action).
+// Different decrease_percent values (50 vs 25) give distinguishable
+// connection_limit results (16 vs 24), so each lookup can unambiguously
+// identify which entry it found.
 #[tokio::test]
 async fn tsa_adjust_config_vs_domain_config_rollup() -> anyhow::Result<()> {
     let mut daemon = DaemonWithTsa::start().await?;

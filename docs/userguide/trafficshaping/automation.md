@@ -161,8 +161,19 @@ Each time this rule matches, `max_message_rate` is cut by 10% of its
 current value (compounding if it matches again while already reduced),
 down to a floor of 25% of the domain's originally configured rate. Once
 15 minutes pass with no further matches, the rate is stepped back up by
-10%, repeating until it's back to the original value. You can monitor
-the current state of any in-progress ramp via:
+10%, repeating until it's back to the original value.
+
+Unlike `duration` on other automation actions, here it's a fixed
+lifetime measured from the *first* trigger -- it is not extended by
+later matches or by ramp-up steps. If `duration` elapses before the
+value has fully recovered, the override is simply removed (the field
+reverts to its original value right away) and the next match starts a
+fresh adjustment from scratch. Pick `duration` generously enough to
+cover the number of `ramp_up_interval`-spaced steps a full recovery from
+the floor would take, plus whatever quiet period you expect before
+ramp-up even begins.
+
+You can monitor the current state of any in-progress ramp via:
 
 ```console
 $ curl http://127.0.0.1:8008/get_config_v1/shaping.toml
@@ -176,8 +187,7 @@ If a percentage doesn't fit your mental model well for a given field --
 for example, you'd rather think in terms of "cut the connection limit by
 5" than "cut it by some percent" -- use the absolute-count fields instead:
 `decrease_amount`/`floor_amount`/`ramp_step_amount` in place of
-`decrease_percent`/`floor_percent`/`ramp_step_percent`. A rule uses one
-style or the other, never both:
+`decrease_percent`/`floor_percent`/`ramp_step_percent`:
 
 {% call toml_data() %}
 [["example.com".automation]]
@@ -189,6 +199,24 @@ duration = "1hr"
 Each match reduces `connection_limit` by a flat 5, down to a floor of 2,
 and ramps back up by 5 per step (`ramp_step_amount` defaults to
 `decrease_amount`) once 10 minutes pass with no further matches.
+
+`decrease`, `floor`, and `ramp_step` each pick their style independently,
+so you can freely mix percentage and absolute-count fields within one
+rule -- for example, cutting by a percentage of the current rate but
+clamping to an absolute floor:
+
+{% call toml_data() %}
+[["example.com".automation]]
+regex = "421 .*too many connections"
+action = {AdjustConfig={name="connection_limit", decrease_percent=10, floor_amount=2, ramp_up_interval="10m"}}
+duration = "1hr"
+{% endcall %}
+
+Here `connection_limit` is cut by 10% of its current value each match,
+never going below a floor of `2` (an absolute count, not a percentage),
+and ramps back up by 10% per step (`ramp_step` still defaults to
+`decrease`'s own value and style when omitted, so it steps back up by
+10% here too).
 
 `AdjustConfig`/`AdjustDomainConfig` also supports `max_deliveries_per_connection`,
 useful for ISPs that complain about too many messages sent over a single

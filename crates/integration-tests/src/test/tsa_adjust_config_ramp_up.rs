@@ -9,8 +9,11 @@ use std::time::Duration;
 // the only real wait involved: decrease_percent=50, floor_percent=25,
 // ramp_step_percent defaults to decrease_percent (50), so from a base
 // connection_limit of 32: one trigger -> 16, then successive prune ticks
-// step 16 -> 24 -> (36, clamped to full recovery and removed since it would
-// exceed 32).
+// step 16 -> 24 -> (36, clamped to 32, the original value). The override
+// entry itself is *not* removed just because it fully recovered -- only
+// the rule's `duration` deadline ever removes an entry -- so
+// connection_limit stays present in the override export at 32 rather than
+// disappearing back to the base default.
 //
 // This test takes a few minutes (waits across multiple real 60s ticks) --
 // it is the only test proving the actual background timer loop drives a
@@ -74,11 +77,12 @@ async fn tsa_adjust_config_ramps_up_after_quiet_period() -> anyhow::Result<()> {
     assert!(stepped, "connection_limit never stepped up to 24");
 
     // Wait for a second tick to fully recover (24 -> would-be 36, clamped
-    // to full recovery): the override is removed and connection_limit
-    // reverts to the base default of 32 (absent from the override export).
+    // to 32): the override entry stays in place (only `duration` removes
+    // an entry, not full recovery), so connection_limit is still present
+    // in the export, now equal to the original value.
     let mut recovered = false;
     for _ in 0..90 {
-        if connection_limit(&daemon).await?.is_none() {
+        if connection_limit(&daemon).await? == Some(32) {
             recovered = true;
             break;
         }
@@ -86,7 +90,7 @@ async fn tsa_adjust_config_ramps_up_after_quiet_period() -> anyhow::Result<()> {
     }
     assert!(
         recovered,
-        "connection_limit override was never removed after full recovery"
+        "connection_limit override never clamped to the original value (32) on full recovery"
     );
 
     daemon.stop().await?;
