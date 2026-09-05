@@ -2787,8 +2787,14 @@ MergedEntry {
                 floor_percent: Some(25.0),
                 ramp_up_interval: std::time::Duration::from_secs(900),
                 ..Default::default()
-            });
-        assert!(bad_decrease.is_err());
+            })
+            .unwrap_err();
+        assert!(
+            bad_decrease
+                .to_string()
+                .contains("decrease_percent must be > 0 and <= 100"),
+            "{bad_decrease}"
+        );
 
         let bad_floor = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
             name: "max_message_rate".to_string(),
@@ -2796,8 +2802,14 @@ MergedEntry {
             floor_percent: Some(100.0),
             ramp_up_interval: std::time::Duration::from_secs(900),
             ..Default::default()
-        });
-        assert!(bad_floor.is_err());
+        })
+        .unwrap_err();
+        assert!(
+            bad_floor
+                .to_string()
+                .contains("floor_percent must be >= 0 and < 100"),
+            "{bad_floor}"
+        );
 
         let zero_interval =
             EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
@@ -2806,8 +2818,14 @@ MergedEntry {
                 floor_percent: Some(25.0),
                 ramp_up_interval: std::time::Duration::from_secs(0),
                 ..Default::default()
-            });
-        assert!(zero_interval.is_err());
+            })
+            .unwrap_err();
+        assert!(
+            zero_interval
+                .to_string()
+                .contains("ramp_up_interval must be greater than zero"),
+            "{zero_interval}"
+        );
     }
 
     #[test]
@@ -2845,8 +2863,12 @@ MergedEntry {
             ramp_step_percent: Some(0.0),
             ramp_up_interval: std::time::Duration::from_secs(900),
             ..Default::default()
-        });
-        assert!(zero.is_err());
+        })
+        .unwrap_err();
+        assert!(
+            zero.to_string().contains("ramp_step_percent must be > 0"),
+            "{zero}"
+        );
 
         let negative = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
             name: "max_message_rate".to_string(),
@@ -2855,8 +2877,14 @@ MergedEntry {
             ramp_step_percent: Some(-5.0),
             ramp_up_interval: std::time::Duration::from_secs(900),
             ..Default::default()
-        });
-        assert!(negative.is_err());
+        })
+        .unwrap_err();
+        assert!(
+            negative
+                .to_string()
+                .contains("ramp_step_percent must be > 0"),
+            "{negative}"
+        );
     }
 
     #[test]
@@ -3082,6 +3110,7 @@ MergedEntry {
                 assert_eq!(adj.decrease, AdjustmentMagnitude::Amount(5));
                 assert_eq!(adj.floor, AdjustmentMagnitude::Amount(2));
                 assert_eq!(adj.ramp_step, AdjustmentMagnitude::Amount(5));
+                assert_eq!(adj.ramp_up_interval, std::time::Duration::from_secs(900));
             }
             other => panic!("expected AdjustConfig, got {other:?}"),
         }

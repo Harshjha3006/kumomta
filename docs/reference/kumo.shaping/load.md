@@ -233,46 +233,33 @@ The following new actions are now supported:
 The following new actions are now supported:
 
  * `{AdjustConfig{name="NAME", ..., ramp_up_interval="DURATION"}}` -
-   define a *relative* configuration adjustment: each time the rule triggers,
-   `NAME` is decreased (compounding on repeated triggers), never going below
-   a floor. Once the rule stops triggering for `ramp_up_interval`, the value
-   is stepped back up, repeating until it reaches its original value, at
-   which point the override is removed. Only numeric rate/limit fields are
-   supported: `max_message_rate`, `max_connection_rate`,
-   `source_selection_rate`, `connection_limit`, and
-   `max_deliveries_per_connection`.
+   define a *relative* configuration adjustment: each trigger decreases
+   `NAME` (compounding on repeated triggers) down to a floor, then ramps
+   it back up once the rule stops triggering for `ramp_up_interval`,
+   repeating until it's back to its original value. Supported fields:
+   `max_message_rate`, `max_connection_rate`, `source_selection_rate`,
+   `connection_limit`, `max_deliveries_per_connection`.
 
-   Unlike other automation actions, `duration` here is a fixed lifetime set
-   when the rule *first* triggers: it is not extended by later triggers or
-   by ramp-up steps. Choose `duration` large enough to cover the worst-case
-   number of ramp-up steps needed to fully recover from the floor back to
-   the original value at `ramp_up_interval` cadence. If `duration` elapses
-   before that recovery completes (or before the triggering condition stops
-   recurring), the override is removed and the field reverts to its
-   original value immediately; a later trigger then starts a new,
-   independent adjustment from scratch.
+   `duration` here is a fixed lifetime from the first trigger, unlike
+   other automation actions -- it is not extended by later triggers or
+   ramp-up steps. Choose it large enough to cover a full recovery from
+   the floor at `ramp_up_interval` cadence, or the override reverts to
+   the original value before recovery completes, and the next trigger
+   starts a fresh adjustment.
 
-   The size of the decrease, the floor, and the ramp-up step are each
-   specified independently, and each may use either of two styles:
-    * **Percentage** - `decrease_percent=N`, `floor_percent=N`,
-      `ramp_step_percent=N`. `NAME` is decreased by `decrease_percent`
-      percent of its current value, never below `floor_percent` percent of
-      its original value, and ramped up by `ramp_step_percent` percent per
-      step.
-    * **Absolute count** - `decrease_amount=N`, `floor_amount=N`,
-      `ramp_step_amount=N`. `NAME` is decreased by a fixed count each
-      trigger, never below `floor_amount`, and ramped up by a fixed count
-      per step.
+   `decrease`, `floor`, and `ramp_step` are each specified independently,
+   using one of two styles:
+    * **Percentage** - `decrease_percent`/`floor_percent`/`ramp_step_percent`,
+      relative to `NAME`'s current value (`decrease`, `ramp_step`) or
+      original value (`floor`).
+    * **Absolute count** - `decrease_amount`/`floor_amount`/`ramp_step_amount`.
       {{since('dev', inline=True)}}
 
-   `decrease` must be specified, using exactly one of `decrease_percent`/
-   `decrease_amount`. `floor` and `ramp_step` are each optional and may use
-   either style regardless of which style `decrease` used (e.g.
-   `decrease_percent` together with `floor_amount` is allowed) -- but for
-   a given field, at most one of its own `_percent`/`_amount` variants may
-   be set. If `floor` is omitted, it defaults to zero in `decrease`'s own
-   style (i.e. no floor beyond the field's own minimum). If `ramp_step` is
-   omitted, it defaults to `decrease` itself (same style and magnitude).
+   `decrease` is required (exactly one style). `floor` defaults to zero in
+   `decrease`'s style; `ramp_step` defaults to `decrease` itself. Each
+   field picks its style independently of the others (e.g.
+   `decrease_percent` with `floor_amount` is fine), but not both styles
+   for the same field.
  * `{AdjustDomainConfig{name="NAME", ...}}` -
    same as `AdjustConfig`, but with `mx_rollup=false`, even if the rule was
    defined inside a domain where `mx_rollup=true`.

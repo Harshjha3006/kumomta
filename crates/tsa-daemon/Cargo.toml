@@ -42,7 +42,6 @@ utoipa = {workspace=true}
 version-info = {path="../version-info"}
 
 [dev-dependencies]
-tempfile.workspace = true
 uuid = {workspace=true}
 
 [lints]

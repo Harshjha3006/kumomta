@@ -163,15 +163,12 @@ down to a floor of 25% of the domain's originally configured rate. Once
 15 minutes pass with no further matches, the rate is stepped back up by
 10%, repeating until it's back to the original value.
 
-Unlike `duration` on other automation actions, here it's a fixed
-lifetime measured from the *first* trigger -- it is not extended by
-later matches or by ramp-up steps. If `duration` elapses before the
-value has fully recovered, the override is simply removed (the field
-reverts to its original value right away) and the next match starts a
-fresh adjustment from scratch. Pick `duration` generously enough to
-cover the number of `ramp_up_interval`-spaced steps a full recovery from
-the floor would take, plus whatever quiet period you expect before
-ramp-up even begins.
+Unlike other automation actions, `duration` here is a fixed lifetime
+from the first trigger, not extended by later matches or ramp-up steps.
+If it elapses before the value fully recovers, the field reverts to its
+original value immediately and the next match starts fresh. Pick
+`duration` generously enough to cover a full recovery from the floor at
+`ramp_up_interval` cadence.
 
 You can monitor the current state of any in-progress ramp via:
 
@@ -202,21 +199,7 @@ and ramps back up by 5 per step (`ramp_step_amount` defaults to
 
 `decrease`, `floor`, and `ramp_step` each pick their style independently,
 so you can freely mix percentage and absolute-count fields within one
-rule -- for example, cutting by a percentage of the current rate but
-clamping to an absolute floor:
-
-{% call toml_data() %}
-[["example.com".automation]]
-regex = "421 .*too many connections"
-action = {AdjustConfig={name="connection_limit", decrease_percent=10, floor_amount=2, ramp_up_interval="10m"}}
-duration = "1hr"
-{% endcall %}
-
-Here `connection_limit` is cut by 10% of its current value each match,
-never going below a floor of `2` (an absolute count, not a percentage),
-and ramps back up by 10% per step (`ramp_step` still defaults to
-`decrease`'s own value and style when omitted, so it steps back up by
-10% here too).
+rule -- e.g. `decrease_percent` with `floor_amount`.
 
 `AdjustConfig`/`AdjustDomainConfig` also supports `max_deliveries_per_connection`,
 useful for ISPs that complain about too many messages sent over a single
