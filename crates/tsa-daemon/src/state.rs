@@ -517,6 +517,7 @@ impl TsaState {
                     over.current_limit,
                 );
                 over.last_activity = now;
+                over.expires = expires;
                 tracing::debug!("adaptive override down-step {scope:?} = {:?}", *over);
             }
             Entry::Vacant(entry) => {
@@ -1578,6 +1579,59 @@ mod tests {
         );
     }
 
+    /// Like every sibling automation action (`SetConfig`, `Suspend`,
+    /// `Bounce`, ...), a repeat down-path trigger pushes `expires` out to
+    /// `this_trigger.timestamp + rule.duration` -- the override's lifetime
+    /// keeps extending as long as the triggering condition keeps
+    /// recurring. Only a successful ramp-up step leaves `expires` alone
+    /// (see `test_up_path_clamps_to_original_limit_on_full_recovery`).
+    #[test]
+    fn test_down_path_extends_expires_on_repeat_trigger() {
+        let state = TsaState::default();
+        let rule = simple_rule(); // duration = 30m
+        let a = adj("connection_limit", 10.0, 25.0, 10.0);
+        let original = toml::Value::Integer(100);
+        let first_record = make_record(Utc::now());
+        let scope = ActionHash::from_rule_and_record(
+            &rule,
+            &Action::AdjustConfig(a.clone()),
+            &first_record,
+        );
+
+        state
+            .create_or_update_adaptive_override(
+                &scope,
+                &rule,
+                &first_record,
+                &a,
+                "example.com",
+                "unspecified",
+                PreferRollup::Yes,
+                &original,
+            )
+            .unwrap();
+        let first_expires = state.adaptive_overrides.get(&scope).unwrap().expires;
+
+        // A second trigger, 5 minutes later, must push expires out to
+        // (its own timestamp) + 30m -- 5 minutes further than the first.
+        let second_record = make_record(first_record.timestamp + chrono::Duration::minutes(5));
+        state
+            .create_or_update_adaptive_override(
+                &scope,
+                &rule,
+                &second_record,
+                &a,
+                "example.com",
+                "unspecified",
+                PreferRollup::Yes,
+                &original,
+            )
+            .unwrap();
+        let second_expires = state.adaptive_overrides.get(&scope).unwrap().expires;
+
+        assert_eq!(second_expires, first_expires + chrono::Duration::minutes(5));
+    }
+
     #[test]
     fn test_down_path_amount_mode_compounds_and_clamps_to_floor() {
         let state = TsaState::default();
@@ -1878,7 +1932,8 @@ mod tests {
             entry.last_activity = Utc::now() - chrono::Duration::seconds(1000);
         }
         // 80 * 1.5 = 120, clamped to original (100); entry is kept (not
-        // removed early) -- only `expires` ever removes an entry.
+        // removed early) -- only `expires` ever removes an entry, and
+        // ramp-up steps (unlike down-path triggers) never touch it.
         let now = Utc::now();
         state.prune_adaptive_overrides(&now, false).await;
         let (current_limit, expires) = {
@@ -1904,7 +1959,9 @@ mod tests {
             expires
         );
 
-        // Only the original fixed `expires` deadline removes it.
+        // With no further down-path triggers, `expires` never moved past
+        // what the first (only) trigger set it to; that deadline still
+        // removes the entry.
         let past_deadline = expires + chrono::Duration::seconds(1);
         state.prune_adaptive_overrides(&past_deadline, false).await;
         assert!(state.adaptive_overrides.get(&scope).is_none());

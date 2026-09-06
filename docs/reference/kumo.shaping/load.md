@@ -240,12 +240,14 @@ The following new actions are now supported:
    `max_message_rate`, `max_connection_rate`, `source_selection_rate`,
    `connection_limit`, `max_deliveries_per_connection`.
 
-   `duration` here is a fixed lifetime from the first trigger, unlike
-   other automation actions -- it is not extended by later triggers or
-   ramp-up steps. Choose it large enough to cover a full recovery from
-   the floor at `ramp_up_interval` cadence, or the override reverts to
-   the original value before recovery completes, and the next trigger
-   starts a fresh adjustment.
+   Like every other automation action, each trigger pushes `expires` out
+   to `duration` from that trigger, so the override stays in effect as
+   long as the triggering condition keeps recurring. Unlike other
+   actions, a successful ramp-up step does *not* extend `expires` --
+   only a fresh trigger does. So if the triggering condition goes quiet,
+   choose `duration` large enough to cover a full recovery from the
+   floor at `ramp_up_interval` cadence, or the override reverts to the
+   original value before recovery completes.
 
    `decrease`, `floor`, and `ramp_step` are each specified independently,
    using one of two styles:

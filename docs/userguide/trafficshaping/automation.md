@@ -163,12 +163,13 @@ down to a floor of 25% of the domain's originally configured rate. Once
 15 minutes pass with no further matches, the rate is stepped back up by
 10%, repeating until it's back to the original value.
 
-Unlike other automation actions, `duration` here is a fixed lifetime
-from the first trigger, not extended by later matches or ramp-up steps.
-If it elapses before the value fully recovers, the field reverts to its
-original value immediately and the next match starts fresh. Pick
-`duration` generously enough to cover a full recovery from the floor at
-`ramp_up_interval` cadence.
+As with other automation actions, each match pushes `duration` out
+again from that match, so the override stays in effect as long as the
+error keeps recurring. Ramp-up steps don't extend it, though -- only a
+fresh match does. So once matches stop, `duration` needs to be
+generous enough to cover a full recovery from the floor at
+`ramp_up_interval` cadence, or the field reverts to its original value
+before recovery completes.
 
 You can monitor the current state of any in-progress ramp via:
 
