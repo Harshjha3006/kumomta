@@ -283,6 +283,15 @@ async fn apply_adjust_config(
     prefer_rollup: PreferRollup,
     shaping: &Shaping,
 ) -> anyhow::Result<()> {
+    let state = TSA_STATE.get().expect("tsa_state missing");
+
+    // Fast path: skip resolving the base value (a shaping-config lookup
+    // that can involve live MX/DNS resolution) once an override already
+    // exists -- its down-step never reads it anyway.
+    if state.down_step_if_present(action_hash, rule, record) {
+        return Ok(());
+    }
+
     let site_name = record
         .site
         .trim_start_matches(&format!("{source}->"))
@@ -311,19 +320,16 @@ async fn apply_adjust_config(
         }
     };
 
-    TSA_STATE
-        .get()
-        .expect("tsa_state missing")
-        .create_or_update_adaptive_override(
-            action_hash,
-            rule,
-            record,
-            adj,
-            domain,
-            source,
-            prefer_rollup,
-            &original_value,
-        )
+    state.create_or_update_adaptive_override(
+        action_hash,
+        rule,
+        record,
+        adj,
+        domain,
+        source,
+        prefer_rollup,
+        &original_value,
+    )
 }
 
 pub async fn publish_log_batch(records: &mut Vec<JsonLogRecord>) -> anyhow::Result<()> {

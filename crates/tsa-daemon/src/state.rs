@@ -291,6 +291,26 @@ fn apply_down_step(
     decreased.max(floor_limit)
 }
 
+/// Down-step an existing `AdaptiveOverride` in place and re-arm
+/// `last_activity`/`expires`. Shared by `down_step_if_present` and
+/// `create_or_update_adaptive_override`'s `Occupied` branch.
+fn down_step_existing(
+    over: &mut AdaptiveOverride,
+    scope: &ActionHash,
+    now: DateTime<Utc>,
+    expires: DateTime<Utc>,
+) {
+    over.current_limit = apply_down_step(
+        over.floor,
+        over.decrease,
+        over.original_limit,
+        over.current_limit,
+    );
+    over.last_activity = now;
+    over.expires = expires;
+    tracing::debug!("adaptive override down-step {scope:?} = {:?}", *over);
+}
+
 /// Apply a ramp-up step: percentage of current value, or a fixed amount
 /// added. Percent mode forces strictly-greater-than-current progress,
 /// since naive rounding can stall on small integers; amount mode always
@@ -482,11 +502,48 @@ impl TsaState {
         self.config_overrides.insert(scope, over);
     }
 
+    /// Down-step `scope` if it already exists, without needing
+    /// `original_value` (an existing entry's down-step never reads it).
+    /// Lets callers like `apply_adjust_config` skip a potentially
+    /// expensive shaping-config lookup on repeat triggers. Returns
+    /// `false` if vacant -- the caller must then resolve
+    /// `original_value` and call `create_or_update_adaptive_override`,
+    /// which handles a concurrent trigger creating the entry first.
+    pub fn down_step_if_present(
+        &self,
+        scope: &ActionHash,
+        rule: &Rule,
+        record: &JsonLogRecord,
+    ) -> bool {
+        let now = record.timestamp;
+        let expires = now + rule.duration;
+
+        if Utc::now() >= expires {
+            // Stale trigger; nothing to do either way, same guard as
+            // create_or_update_adaptive_override's own.
+            return true;
+        }
+
+        match self.adaptive_overrides.get_mut(scope) {
+            Some(mut over) => {
+                down_step_existing(&mut over, scope, now, expires);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Apply the down-path of an AdjustConfig/AdjustDomainConfig action:
     /// create the override entry on first trigger (seeding it from
     /// `original_value`), or compound the existing entry's current value
     /// down by `decrease` (a percentage or absolute count), clamped at
     /// `floor` of the original value.
+    ///
+    /// Callers should try `down_step_if_present` first and only fall
+    /// back here on `false`. Still handles both `Vacant` and `Occupied`
+    /// itself, though -- a concurrent trigger can create the entry
+    /// between that check and this call, so `Occupied` here is a live
+    /// race outcome, not dead code.
     pub fn create_or_update_adaptive_override(
         &self,
         scope: &ActionHash,
@@ -516,16 +573,7 @@ impl TsaState {
         // other matched actions.
         match self.adaptive_overrides.entry(scope.clone()) {
             Entry::Occupied(mut entry) => {
-                let over = entry.get_mut();
-                over.current_limit = apply_down_step(
-                    over.floor,
-                    over.decrease,
-                    over.original_limit,
-                    over.current_limit,
-                );
-                over.last_activity = now;
-                over.expires = expires;
-                tracing::debug!("adaptive override down-step {scope:?} = {:?}", *over);
+                down_step_existing(entry.get_mut(), scope, now, expires);
             }
             Entry::Vacant(entry) => {
                 let (original_limit, template) =
@@ -1647,6 +1695,60 @@ mod tests {
         assert_eq!(second_expires, first_expires + chrono::Duration::minutes(5));
     }
 
+    /// Must not create an entry when vacant -- callers rely on `false`
+    /// meaning "resolve `original_value` and call
+    /// `create_or_update_adaptive_override` instead".
+    #[test]
+    fn test_down_step_if_present_false_when_vacant() {
+        let state = TsaState::default();
+        let rule = simple_rule();
+        let a = adj("connection_limit", 10.0, 25.0, 10.0);
+        let record = make_record(Utc::now());
+        let scope =
+            ActionHash::from_rule_and_record(&rule, &Action::AdjustConfig(a.clone()), &record);
+
+        assert!(!state.down_step_if_present(&scope, &rule, &record));
+        assert!(state.adaptive_overrides.get(&scope).is_none());
+    }
+
+    /// Down-steps an existing entry (same as `create_or_update`'s
+    /// `Occupied` branch -- they share `down_step_existing`) and
+    /// returns `true`.
+    #[test]
+    fn test_down_step_if_present_true_and_steps_when_occupied() {
+        let state = TsaState::default();
+        let rule = simple_rule();
+        let a = adj("connection_limit", 10.0, 25.0, 10.0);
+        let original = toml::Value::Integer(100);
+        let record = make_record(Utc::now());
+        let scope =
+            ActionHash::from_rule_and_record(&rule, &Action::AdjustConfig(a.clone()), &record);
+
+        state
+            .create_or_update_adaptive_override(
+                &scope,
+                &rule,
+                &record,
+                &a,
+                "example.com",
+                "unspecified",
+                PreferRollup::Yes,
+                &original,
+            )
+            .unwrap();
+        assert_eq!(
+            state.adaptive_overrides.get(&scope).unwrap().current_limit,
+            90
+        );
+
+        let second_record = make_record(Utc::now());
+        assert!(state.down_step_if_present(&scope, &rule, &second_record));
+        assert_eq!(
+            state.adaptive_overrides.get(&scope).unwrap().current_limit,
+            81
+        );
+    }
+
     #[test]
     fn test_down_path_amount_mode_compounds_and_clamps_to_floor() {
         let state = TsaState::default();
@@ -1829,8 +1931,10 @@ mod tests {
             80
         );
 
-        // Simulate the ramp_up_interval (900s) having elapsed by directly
-        // rewinding last_activity, exactly as a real 15-minute quiet period would.
+        // Simulate the ramp_up_interval (900s) having elapsed by rewinding
+        // last_activity only -- fine since this test doesn't assert on
+        // expires; see test_up_path_extends_expires_on_ramp_step, which
+        // does and rewinds both fields to keep the invariant correct.
         {
             let mut entry = state.adaptive_overrides.get_mut(&scope).unwrap();
             entry.last_activity = Utc::now() - chrono::Duration::seconds(1000);
@@ -1946,6 +2050,8 @@ mod tests {
                 break;
             }
             {
+                // Rewinds only last_activity; see the note in
+                // test_up_path_steps_and_resets_last_activity.
                 let mut entry = state.adaptive_overrides.get_mut(&scope).unwrap();
                 entry.last_activity = Utc::now() - chrono::Duration::seconds(1000);
             }
@@ -1996,6 +2102,11 @@ mod tests {
         );
 
         {
+            // Rewinds only last_activity (see the note in
+            // test_up_path_steps_and_resets_last_activity), so expires
+            // below is inflated relative to rule.duration -- fine since
+            // this test only compares expires for equality, never an
+            // absolute value.
             let mut entry = state.adaptive_overrides.get_mut(&scope).unwrap();
             entry.last_activity = Utc::now() - chrono::Duration::seconds(1000);
         }
@@ -2063,6 +2174,8 @@ mod tests {
         );
 
         {
+            // Rewinds only last_activity; see the note in
+            // test_up_path_steps_and_resets_last_activity.
             let mut entry = state.adaptive_overrides.get_mut(&scope).unwrap();
             entry.last_activity = Utc::now() - chrono::Duration::seconds(1000);
         }

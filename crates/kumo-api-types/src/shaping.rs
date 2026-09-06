@@ -240,7 +240,7 @@ impl Hash for AdjustmentMagnitude {
 /// original value. `decrease`, `floor`, and `ramp_step` are each
 /// independently either `Percent` or `Amount` -- see
 /// `EgressPathConfigAdjustmentUnchecked`'s `TryFrom` validation.
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, Hash)]
 #[serde(
     try_from = "EgressPathConfigAdjustmentUnchecked",
     into = "EgressPathConfigAdjustmentUnchecked"
@@ -251,16 +251,6 @@ pub struct EgressPathConfigAdjustment {
     pub floor: AdjustmentMagnitude,
     pub ramp_step: AdjustmentMagnitude,
     pub ramp_up_interval: Duration,
-}
-
-impl Hash for EgressPathConfigAdjustment {
-    fn hash<H: Hasher>(&self, h: &mut H) {
-        self.name.hash(h);
-        self.decrease.hash(h);
-        self.floor.hash(h);
-        self.ramp_step.hash(h);
-        self.ramp_up_interval.hash(h);
-    }
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, Default)]
@@ -342,7 +332,7 @@ fn ramp_step_magnitude(
         }
         (Some(p), None) => {
             if p.is_nan() || p <= 0.0 || p >= 100.0 {
-                anyhow::bail!("ramp_step_percent must be > 0, got {p}");
+                anyhow::bail!("ramp_step_percent must be > 0 and < 100, got {p}");
             }
             Ok(AdjustmentMagnitude::Percent(p))
         }
@@ -2866,7 +2856,8 @@ MergedEntry {
         })
         .unwrap_err();
         assert!(
-            zero.to_string().contains("ramp_step_percent must be > 0"),
+            zero.to_string()
+                .contains("ramp_step_percent must be > 0 and < 100"),
             "{zero}"
         );
 
@@ -2882,8 +2873,25 @@ MergedEntry {
         assert!(
             negative
                 .to_string()
-                .contains("ramp_step_percent must be > 0"),
+                .contains("ramp_step_percent must be > 0 and < 100"),
             "{negative}"
+        );
+
+        // Upper bound must also be rejected, with a message mentioning it.
+        let too_large = EgressPathConfigAdjustment::try_from(EgressPathConfigAdjustmentUnchecked {
+            name: "max_message_rate".to_string(),
+            decrease_percent: Some(10.0),
+            floor_percent: Some(25.0),
+            ramp_step_percent: Some(100.0),
+            ramp_up_interval: std::time::Duration::from_secs(900),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(
+            too_large
+                .to_string()
+                .contains("ramp_step_percent must be > 0 and < 100"),
+            "{too_large}"
         );
     }
 
