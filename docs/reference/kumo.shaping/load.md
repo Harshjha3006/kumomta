@@ -242,12 +242,15 @@ The following new actions are now supported:
 
    Like every other automation action, each trigger pushes `expires` out
    to `duration` from that trigger, so the override stays in effect as
-   long as the triggering condition keeps recurring. Unlike other
-   actions, a successful ramp-up step does *not* extend `expires` --
-   only a fresh trigger does. So if the triggering condition goes quiet,
-   choose `duration` large enough to cover a full recovery from the
-   floor at `ramp_up_interval` cadence, or the override reverts to the
-   original value before recovery completes.
+   long as the triggering condition keeps recurring. A successful
+   ramp-up step also pushes `expires` out by another `duration`, so an
+   in-progress recovery isn't cut short and snapped back to the original
+   value just because `duration` was sized for a shorter ramp than
+   actually needed. The override is only ever removed once *neither* a
+   trigger nor a completed step has happened for a full `duration` --
+   which also means a `duration` that's too short for a stalled ramp
+   (e.g. `ramp_up_interval` set unreasonably long) still bounds how long
+   it can persist below its original value.
 
    `decrease`, `floor`, and `ramp_step` are each specified independently,
    using one of two styles:

@@ -321,6 +321,11 @@ pub struct AdaptiveOverride {
     pub floor: AdjustmentMagnitude,
     pub ramp_step: AdjustmentMagnitude,
     pub ramp_up_interval_secs: i64,
+    /// Invariant: wherever `last_activity`/`expires` are set (creation,
+    /// a down-path trigger, or an up-path ramp step), they're always set
+    /// together such that `expires - last_activity` equals the
+    /// triggering rule's `duration`. This lets a ramp step re-arm
+    /// `expires` by that same duration without storing it separately.
     pub last_activity: DateTime<Utc>,
     pub expires: DateTime<Utc>,
 }
@@ -332,8 +337,10 @@ enum RampDecision {
     NotDue,
     /// `expires` has passed: discard the entry. The only removal path --
     /// an entry that fully recovers before `expires` is clamped at
-    /// `original_limit` (`StepTo`) rather than removed early, so a rule's
-    /// `duration` is the sole thing that ends an episode.
+    /// `original_limit` (`StepTo`) rather than removed early. Both a
+    /// down-path trigger and a successful ramp step push `expires` out
+    /// again, so an episode only ends once neither has happened for a
+    /// full `duration`.
     Remove,
     /// Ramp up to this new `current_limit`, clamped at `original_limit`.
     StepTo(u64),
@@ -1054,8 +1061,16 @@ impl TsaState {
                     RampDecision::NotDue => false,
                     RampDecision::Remove => true,
                     RampDecision::StepTo(increased) => {
+                        // Re-arm `expires` the same `rule.duration` further
+                        // out, derived from the invariant that `expires -
+                        // last_activity` always equals the triggering
+                        // rule's `duration` (both fields are set together
+                        // everywhere they're touched -- see the struct's
+                        // doc comment).
+                        let duration = over.expires - over.last_activity;
                         over.current_limit = increased;
                         over.last_activity = *now;
+                        over.expires = *now + duration;
                         stepped = true;
                         false
                     }
@@ -1832,6 +1847,59 @@ mod tests {
         assert_eq!(
             state.adaptive_overrides.get(&scope).unwrap().current_limit,
             88
+        );
+    }
+
+    /// A successful ramp-up step re-arms `expires` by the same
+    /// `rule.duration` as a down-path trigger would, derived from
+    /// `expires - last_activity` (see the invariant on `AdaptiveOverride`).
+    /// Rewinds `last_activity` *and* `expires` by the same amount to
+    /// simulate the quiet period elapsing without lying about the
+    /// entry's true duration (unlike the plain `last_activity`-only
+    /// rewind other tests use, which is fine for them since they never
+    /// assert on `expires`).
+    #[tokio::test]
+    async fn test_up_path_extends_expires_on_ramp_step() {
+        let state = TsaState::default();
+        let record = make_record(Utc::now());
+        let rule = simple_rule(); // duration = 30m
+        let a = adj("connection_limit", 20.0, 25.0, 10.0);
+        let original = toml::Value::Integer(100);
+        let scope =
+            ActionHash::from_rule_and_record(&rule, &Action::AdjustConfig(a.clone()), &record);
+
+        state
+            .create_or_update_adaptive_override(
+                &scope,
+                &rule,
+                &record,
+                &a,
+                "example.com",
+                "unspecified",
+                PreferRollup::Yes,
+                &original,
+            )
+            .unwrap();
+        let created_expires = state.adaptive_overrides.get(&scope).unwrap().expires;
+
+        {
+            let mut entry = state.adaptive_overrides.get_mut(&scope).unwrap();
+            entry.last_activity -= chrono::Duration::seconds(1000);
+            entry.expires -= chrono::Duration::seconds(1000);
+        }
+        let now = Utc::now();
+        state.prune_adaptive_overrides(&now, false).await;
+
+        let entry = state.adaptive_overrides.get(&scope).unwrap();
+        assert_eq!(entry.current_limit, 88, "80 * 1.10 = 88");
+        assert_eq!(
+            entry.expires,
+            now + rule.duration,
+            "ramp step should re-arm expires by exactly rule.duration"
+        );
+        assert!(
+            entry.expires > created_expires,
+            "the re-armed expires should be further out than the original creation deadline"
         );
     }
 

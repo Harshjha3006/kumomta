@@ -165,11 +165,10 @@ down to a floor of 25% of the domain's originally configured rate. Once
 
 As with other automation actions, each match pushes `duration` out
 again from that match, so the override stays in effect as long as the
-error keeps recurring. Ramp-up steps don't extend it, though -- only a
-fresh match does. So once matches stop, `duration` needs to be
-generous enough to cover a full recovery from the floor at
-`ramp_up_interval` cadence, or the field reverts to its original value
-before recovery completes.
+error keeps recurring. A completed ramp-up step also pushes `duration`
+out again, so a slow recovery doesn't get cut off partway through and
+snap back to the original value -- the override only goes away once
+neither a match nor a step has happened for a full `duration`.
 
 You can monitor the current state of any in-progress ramp via:
 
