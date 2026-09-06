@@ -1932,8 +1932,7 @@ mod tests {
             entry.last_activity = Utc::now() - chrono::Duration::seconds(1000);
         }
         // 80 * 1.5 = 120, clamped to original (100); entry is kept (not
-        // removed early) -- only `expires` ever removes an entry, and
-        // ramp-up steps (unlike down-path triggers) never touch it.
+        // removed early) -- only `expires` ever removes an entry.
         let now = Utc::now();
         state.prune_adaptive_overrides(&now, false).await;
         let (current_limit, expires) = {
